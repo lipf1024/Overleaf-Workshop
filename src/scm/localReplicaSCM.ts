@@ -146,6 +146,22 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             };
             this.commandDisposables=[
                 ConflictManager.acquireResources(),
+                vscode.commands.registerCommand('overleaf-workshop.localReplica.syncFile',async(target?:vscode.Uri|vscode.SourceControlResourceState)=>{
+                    const uri=target instanceof vscode.Uri?target:target?.resourceUri??vscode.window.activeTextEditor?.document.uri;
+                    if (!uri || uri.scheme!=='file') { return; }
+                    const provider=[...this.instances].filter(item=>uri.fsPath.startsWith(item.baseUri.fsPath+path.sep))
+                        .sort((a,b)=>b.baseUri.fsPath.length-a.baseUri.fsPath.length)[0];
+                    if (!provider?.coordinator) { return vscode.window.showWarningMessage('This file does not belong to an active Overleaf local replica.'); }
+                    if (vscode.workspace.textDocuments.some(doc=>doc.uri.toString()===uri.toString()&&doc.isDirty)) {
+                        return vscode.window.showWarningMessage('Save this file before synchronizing it.');
+                    }
+                    const relative=path.relative(provider.baseUri.fsPath,uri.fsPath).split(path.sep).join('/');
+                    try {
+                        await provider.coordinator.syncPath(relative);
+                        const record=provider.coordinator.records().find(item=>item.path===relative);
+                        if (record && record.status!=='clean') { await vscode.window.showWarningMessage(record.message??'This file still has pending changes. Review Source Control.'); }
+                    } catch (error:any) { await vscode.window.showWarningMessage(`Unable to sync this file: ${error.message}`); }
+                }),
                 vscode.commands.registerCommand('overleaf-workshop.localReplica.syncNow',withProvider(provider=>provider.coordinator!.syncNow())),
                 vscode.commands.registerCommand('overleaf-workshop.localReplica.reviewPending',()=>vscode.commands.executeCommand('workbench.view.scm')),
                 vscode.commands.registerCommand('overleaf-workshop.localReplica.setSyncMode',withProvider(provider=>provider.selectSyncMode())),
@@ -467,7 +483,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private updateSourceControl(records:FileSyncRecord[]):void {
         const item=(record:FileSyncRecord):vscode.SourceControlResourceState=>({resourceUri:vscode.Uri.joinPath(this.baseUri,record.path),
             command:record.pendingConflictId && this.coordinator?.isOwner && !record.suspension?{command:'overleaf-workshop.localReplica.openConflict',title:'Open Conflict Editor',arguments:[record.pendingConflictId]}:undefined,
-            contextValue:hasUnresolvedConflict(record)?'overleafConflict':undefined,
+            contextValue:hasUnresolvedConflict(record)?'overleafConflict':!record.suspension?'overleafSyncFile':undefined,
             decorations:{tooltip:hasUnresolvedConflict(record)?'Overleaf conflict: '+(record.message??'Synchronization paused'):record.message,
                 iconPath:hasUnresolvedConflict(record)?new vscode.ThemeIcon('warning',new vscode.ThemeColor('gitDecoration.conflictingResourceForeground')):undefined}});
         this.incoming!.resourceStates=records.filter(r=>!r.suspension && !hasUnresolvedConflict(r) && (r.status==='pending-download'||r.status==='remote-changed')).map(item);

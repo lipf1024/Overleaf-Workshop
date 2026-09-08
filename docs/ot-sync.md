@@ -12,6 +12,10 @@
 
 官方依据：[客户端确认、pending/inflight 变换](https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/web/frontend/js/vendor/libs/sharejs.js)、[5 秒重试与 45 秒期限](https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/web/frontend/js/features/ide-react/editor/share-js-doc.ts)、[服务端紧凑确认分发](https://github.com/overleaf/overleaf/blob/28ad3b03b71cb4311decdcb55c36b33ec10d72db/services/real-time/app/js/DocumentUpdaterController.js)。
 
+## 单文件同步入口（0.16.21）
+
+资源管理器文件右键及 Source Control 的 Incoming/Outgoing 条目提供 **Local Replica: Sync This File**。它既可首次上传新文件，也可同步已有文本、PDF 等文件的已保存修改，只处理所选路径，不扫描整个项目。同名冲突和恢复保护保留；有未保存内容时先提示保存。项目级入口另称 **Sync Project Now**。Review Pending Changes 和 Toggle Auto Sync 不再重复出现在文件右键菜单。
+
 ## 编辑器、磁盘与编译
 
 - 磁盘内容与未保存编辑器内容分层处理。远端变化实时合并到脏编辑器，保持未保存状态；干净编辑器通过文件提供器/磁盘变化重新加载，避免人为制造脏文件。

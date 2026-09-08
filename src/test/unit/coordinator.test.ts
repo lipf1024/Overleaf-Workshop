@@ -80,6 +80,29 @@ suite('SyncCoordinator fault safety',()=>{
         await first;
         const next=coordinator.syncNow(); assert.notStrictEqual(next,first); await next;
     });
+    test('single-file sync uploads a new file without scanning or uploading its neighbors',async()=>{
+        const coordinator=new SyncCoordinator(store,adapter,'safeAuto'); await coordinator.initialize();
+        await fs.writeFile(path.join(root,'new.tex'),bytes('new file\n'));
+        await fs.writeFile(path.join(root,'other.tex'),bytes('keep local\n'));
+        adapter.listPaths=async()=>{throw new Error('Single-file sync must not scan the project');};
+        await coordinator.syncPath('new.tex');
+        assert.strictEqual(Buffer.from(adapter.remote.get('new.tex')!).toString(),'new file\n');
+        assert.strictEqual(adapter.remote.has('other.tex'),false); assert.strictEqual(adapter.applyCount,1);
+    });
+    test('single-file sync also updates an existing file with automatic sync disabled',async()=>{
+        const coordinator=new SyncCoordinator(store,adapter,'manual'); await coordinator.initialize();
+        await fs.writeFile(path.join(root,'main.tex'),bytes('edited\n'));
+        await coordinator.syncPath('main.tex');
+        assert.strictEqual(Buffer.from(adapter.remote.get('main.tex')!).toString(),'edited\n');
+        assert.strictEqual(coordinator.records().find(record=>record.path==='main.tex')?.status,'clean');
+    });
+    test('single-file sync does not overwrite a same-name file without a shared baseline',async()=>{
+        const coordinator=new SyncCoordinator(store,adapter,'safeAuto'); await coordinator.initialize();
+        adapter.remote.set('new.tex',bytes('remote\n')); await fs.writeFile(path.join(root,'new.tex'),bytes('local\n'));
+        await coordinator.syncPath('new.tex');
+        assert.strictEqual(adapter.applyCount,0);
+        assert.strictEqual(coordinator.records().find(record=>record.path==='new.tex')?.status,'conflict');
+    });
 
     test('manual sync waits for automatic upload without sending it twice',async()=>{
         const coordinator=new SyncCoordinator(store,adapter,'safeAuto'); await coordinator.initialize();

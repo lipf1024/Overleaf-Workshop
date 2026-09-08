@@ -1,6 +1,15 @@
 # Changelog
 
 
+## 0.16.21
+
+- Add Sync This File to Explorer and Source Control resources for both new and existing files, without scanning or syncing the whole project.
+- Name the project action Sync Project Now, and replace the remaining hard-coded Chinese sync command titles with English.
+
+## 0.16.20
+
+- Remove the duplicate Review Pending Changes and Toggle Auto Sync entries from the Explorer context menu; retain their commands and existing page controls.
+
 ## 0.16.19
 
 - Share an official-text-OT session between remote editing and initialized local replica text synchronization: compose pending operations, transform concurrent changes, and upload only at save boundaries.

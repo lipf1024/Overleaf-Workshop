@@ -2,7 +2,7 @@
   "name": "overleaf-workshop",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.16.19",
+  "version": "0.16.21",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "lipf",
@@ -117,8 +117,14 @@
     ],
     "commands": [
       {
+        "command": "overleaf-workshop.localReplica.syncFile",
+        "title": "Local Replica: Sync This File",
+        "icon": "$(sync)",
+        "category": "%extension.displayName%"
+      },
+      {
         "command": "overleaf-workshop.localReplica.syncNow",
-        "title": "本地副本：立即同步",
+        "title": "Local Replica: Sync Project Now",
         "icon": "$(sync)",
         "category": "%extension.displayName%"
       },
@@ -130,7 +136,7 @@
       },
       {
         "command": "overleaf-workshop.localReplica.setSyncMode",
-        "title": "本地副本：切换自动同步",
+        "title": "Local Replica: Toggle Auto Sync",
         "icon": "$(settings-gear)",
         "category": "%extension.displayName%"
       },
@@ -690,6 +696,16 @@
           "command": "overleaf-workshop.localReplica.useRemote",
           "when": "scmProvider == overleafLocalReplica && scmResourceState == overleafConflict",
           "group": "overleaf@3"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.syncFile",
+          "when": "scmProvider == overleafLocalReplica && scmResourceState == overleafSyncFile",
+          "group": "inline@1"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.syncFile",
+          "when": "scmProvider == overleafLocalReplica && scmResourceState == overleafSyncFile",
+          "group": "overleaf@1"
         }
       ],
       "explorer/context": [
@@ -699,19 +715,9 @@
           "group": "overleaf@0"
         },
         {
-          "command": "overleaf-workshop.localReplica.syncNow",
-          "when": "overleaf-workshop.localReplicaWorkspace && resourceScheme == file",
+          "command": "overleaf-workshop.localReplica.syncFile",
+          "when": "overleaf-workshop.localReplicaWorkspace && resourceScheme == file && !explorerResourceIsFolder",
           "group": "overleaf@1"
-        },
-        {
-          "command": "overleaf-workshop.localReplica.reviewPending",
-          "when": "overleaf-workshop.localReplicaWorkspace && resourceScheme == file",
-          "group": "overleaf@2"
-        },
-        {
-          "command": "overleaf-workshop.localReplica.setSyncMode",
-          "when": "overleaf-workshop.localReplicaWorkspace && resourceScheme == file",
-          "group": "overleaf@3"
         },
         {
           "command": "overleaf-workshop.remoteFileSystem.refreshLinkedFile",

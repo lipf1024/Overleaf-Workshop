@@ -177,6 +177,12 @@ export class SyncCoordinator {
         await this.enqueue(path,()=>this.setFrozen(path,message));
     }
     private manualSync?:Promise<void>;
+    syncPath(path:string):Promise<void> {
+        const issue=validateReplicaPath(path);
+        if (issue) { return Promise.reject(new Error(issue)); }
+        if (!this.isOwner) { return Promise.reject(new Error('Synchronization is owned by another window')); }
+        return this.enqueue(path,()=>this.reconcilePath(path,'manual','safeAuto',false));
+    }
     syncNow():Promise<void> {
         if (this.manualSync) { return this.manualSync; }
         const task=this.runManualSync().finally(()=>{
@@ -472,7 +478,7 @@ export class SyncCoordinator {
         this.state.files[record.key]=record; await this.persist(); return false;
     }
 
-    private async reconcilePath(rawPath:string,cause:'bootstrap'|'local'|'remote'|'manual',modeOverride?:SyncMode):Promise<void> {
+    private async reconcilePath(rawPath:string,cause:'bootstrap'|'local'|'remote'|'manual',modeOverride?:SyncMode,allowRename=true):Promise<void> {
         const path=normalizePath(rawPath);
         this.compileConfirmations.delete(pathComparisonKey(path));
         if (!await this.allowPath(path)) { return; }
@@ -548,7 +554,7 @@ export class SyncCoordinator {
                 case 'merge': if (decision.merged && remote) { await this.merge(record,decision.merged,remote); } break;
                 case 'delete-local': await this.deleteLocal(record,remote?.revision,record.base?.hash,this.adapter.connectionEpoch?.()); break;
                 case 'delete-remote':
-                    if (!await this.tryLocalRename(record,remote!)) { await this.deleteRemote(record,remote?.revision); }
+                    if (!allowRename || !await this.tryLocalRename(record,remote!)) { await this.deleteRemote(record,remote?.revision); }
                     break;
                 case 'conflict': await this.freezeConflict(record,base,local,remote,decision.reason??'Concurrent changes',decision.hunks??[],decision.merged); break;
             }
