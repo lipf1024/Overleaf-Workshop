@@ -1,0 +1,15 @@
+{
+  "commands.localReplica.markResolved.title": "本地副本：标记冲突为已解决",
+  "commands.localReplica.markResolved.shortTitle": "标记为已解决",
+  "commands.localReplica.completeMerge.title": "本地副本：标记冲突为已解决",
+  "commands.localReplica.completeMerge.shortTitle": "标记为已解决",
+  "commands.localReplica.reviewRecovery.title": "本地副本：检查恢复文件",
+  "commands.remoteFileSystem.retryConnection.title": "Overleaf：重新连接",
+  "configuration.common.title": "Overleaf Workshop：公用",
+  "configuration.localReplica.title": "Overleaf Workshop：本地副本",
+  "configuration.remote.title": "Overleaf Workshop：远端项目",
+  "configuration.localReplica.syncMode.markdownDescription": "选择此本地副本的同步方式。自动同步：开会自动应用稳定且无冲突的更改；关闭自动同步后只记录更改，直到运行“本地副本：立即同步”。",
+  "configuration.localReplica.syncMode.safeAuto.label": "自动同步：开",
+  "configuration.localReplica.syncMode.manual.label": "自动同步：关",
+  "configuration.localReplica.enableCompileNPreview.markdownDescription": "为此本地副本启用 Overleaf 编译和 PDF 预览。修改后立即生效。这里显式设置的值优先于 `.overleaf/settings.json` 中旧的 `enableCompileNPreview` 值。"
+}

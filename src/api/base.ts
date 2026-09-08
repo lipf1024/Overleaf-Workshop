@@ -1,9 +1,11 @@
 /* eslint-disable @typescript-eslint/naming-convention */
-import * as stream from 'stream';
-import * as FormData from 'form-data';
 import { v4 as uuidv4 } from 'uuid';
-import { fetch } from 'undici';
+import { mergeCookies } from './cookies';
+import { PdfByteSource, PdfSourceDescriptor } from './pdfByteSource';
+import { File } from 'node:buffer';
+import { FormData } from 'undici';
 import { FileEntity, FileType, FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
+import { asNetworkError, classifyResponseStatus, createFileUploadFormData, downloadBytes, fetchWithPolicy, FetchPolicy, TRANSFER_TIMEOUT_MS, NetworkErrorKind, NetworkRequestError } from './network';
 
 /** Extract set-cookie headers from an undici/Response object. */
 function getSetCookie(res: any): string[] {
@@ -11,7 +13,7 @@ function getSetCookie(res: any): string[] {
         return res.headers.getSetCookie();
     }
     const raw = res.headers?.raw?.()?.['set-cookie'];
-    if (raw) return raw;
+    if (raw) { return raw; }
     return [];
 }
 
@@ -27,7 +29,7 @@ export interface NewProjectResponseSchema {
 }
 
 export interface CompileResponseSchema {
-    status: 'success' | 'failure' | 'error';
+    status: string;
     compileGroup: string;
     clsiServerId?: string;
     pdfDownloadDomain?: string;
@@ -177,6 +179,8 @@ export interface ProjectSettingsSchema {
 
 export interface ResponseSchema {
     type: 'success' | 'error';
+    errorKind?: NetworkErrorKind;
+    statusCode?: number;
     raw?: ArrayBuffer;
     message?: string;
     userInfo?: {userId:string, userEmail:string};
@@ -202,34 +206,37 @@ export interface ResponseSchema {
 export class BaseAPI {
     private url: string;
     private identity?: Identity;
+    private readonly uploadQueues=new Map<string,Promise<unknown>>();
 
     constructor(url:string) {
         this.url = url;
     }
 
     private async getCsrfToken(): Promise<Identity> {
-        const res = await fetch(this.url+'login', {
+        const res = await fetchWithPolicy(this.url+'login', {
             method: 'GET', redirect: 'manual',
-        });
+        }, {idempotent:true});
+        if (res.status!==200) { await res.body?.cancel().catch(()=>undefined); throw new NetworkRequestError(classifyResponseStatus(res.status),`Failed to open login page (${res.status})`,res.status); }
         const body = await res.text();
         const match = body.match(/<input.*name="_csrf".*value="([^"]*)">/);
         if (!match) {
             throw new Error('Failed to get CSRF token.');
         } else {
             const csrfToken = match[1];
-            const cookies = getSetCookie(res)[0]?.split(';')[0] ?? '';
+            const cookies = mergeCookies('',getSetCookie(res));
             return { csrfToken, cookies };
         }
     }
 
     private async getUserId(cookies:string) {
-        const res = await fetch(this.url+'project', {
+        const res = await fetchWithPolicy(this.url+'project', {
             method: 'GET', redirect:'manual',
             headers: {
                 'Connection': 'keep-alive',
                 'Cookie': cookies,
             }
-        });
+        }, {idempotent:true});
+        if (res.status!==200) { await res.body?.cancel().catch(()=>undefined); return undefined; }
 
         const body = await res.text();
         const userIDMatch = body.match(/<meta\s+name="ol-user_id"\s+content="([^"]*)">/);
@@ -239,7 +246,7 @@ export class BaseAPI {
             const userId = userIDMatch[1];
             const csrfToken = csrfTokenMatch[1];
             const userEmail = userEmailMatch ? userEmailMatch[1] : '';
-            return {userId, userEmail, csrfToken};
+            return {userId, userEmail, csrfToken, cookies:mergeCookies(cookies,getSetCookie(res))};
         } else {
             return undefined;
         }
@@ -253,7 +260,7 @@ export class BaseAPI {
             // Creating new connections without proper teardown of old ones causes TCP RST packets
             // when the server sends data on abandoned connections (see issue #309).
             // Note: socket.io-client 0.9.x uses space-separated option names.
-            reconnect: true,
+            reconnect: false,
             'reconnection delay': 1000,
             'reconnection limit': 16000,
             'max reconnection attempts': 10,
@@ -267,7 +274,7 @@ export class BaseAPI {
 
     async passportLogin(email:string, password:string): Promise<ResponseSchema> {
         const identity = await this.getCsrfToken();
-        const res = await fetch(this.url+'login', {
+        const res = await fetchWithPolicy(this.url+'login', {
             method: 'POST', redirect: 'manual',
             headers: {
                 'Accept': '*/*',
@@ -278,30 +285,28 @@ export class BaseAPI {
                 'X-Csrf-Token': identity.csrfToken,
             },
             body: JSON.stringify({ _csrf: identity.csrfToken, email: email, password: password })
-        });
+        }, {idempotent:false});
 
         if (res.status===302) {
-            const redirect = ((await res.text()).match(/Found. Redirecting to (.*)/) as any)[1];
+            const redirect = res.headers.get('location') ?? (await res.text()).match(/Found. Redirecting to (.*)/)?.[1];
+            await res.body?.cancel().catch(()=>undefined);
             if (redirect==='/project') {
-                const cookies = getSetCookie(res)[0] ?? '';
+                const cookies = mergeCookies(identity.cookies,getSetCookie(res));
                 return (await this.cookiesLogin(cookies));
             } else {
                 return {
                     type: 'error',
-                    message: `Redirecting to /${redirect}`
+                    message: `Additional login step required: ${redirect??'unknown redirect'}`
                 };
             }
         }
-        else if (res.status===200) {
-            return {
-                type: 'error',
-                message: (await res.json() as any).message.message
-            };
-        } else if (res.status===401) {
-            return {
-                type: 'error',
-                message: (await res.json() as any).message.text
-            };
+        else if (res.status===200 || res.status===401) {
+            const body=await res.json() as any;
+            if (res.status===200 && body.redir==='/project') {
+                return this.cookiesLogin(mergeCookies(identity.cookies,getSetCookie(res)));
+            }
+            const message=typeof body.message==='string'?body.message:body.message?.text;
+            return {type:'error',message:message || (body.redir?`Additional login step required: ${body.redir}`:'Login failed. Please sign in with browser cookies.')};
         } else {
             return {
                 type: 'error',
@@ -314,7 +319,7 @@ export class BaseAPI {
         const res = await this.getUserId(cookies);
         if (res) {
             const { userId, userEmail, csrfToken } = res;
-            const identity: Identity =  await this.updateCookies({ cookies, csrfToken });
+            const identity: Identity =  await this.updateCookies({ cookies:res.cookies, csrfToken });
             return {
                 type: 'success',
                 userInfo: {userId, userEmail},
@@ -329,18 +334,17 @@ export class BaseAPI {
     }
 
     async updateCookies(identity: Identity) {
-        const res = await fetch(this.url + 'socket.io/socket.io.js', {
+        const res = await fetchWithPolicy(this.url + 'socket.io/socket.io.js', {
             method: 'GET',
             redirect: 'manual',
             headers: {
                 'Connection': 'keep-alive',
                 'Cookie': identity.cookies,
             }
-        });
-        const cookies = getSetCookie(res)[0]?.split(';')[0];
-        if (cookies) {
-            identity.cookies = `${identity.cookies}; ${cookies}`;
-        }
+        }, {idempotent:true});
+        if (res.status!==200) { await res.body?.cancel().catch(()=>undefined); throw new NetworkRequestError(classifyResponseStatus(res.status),`Failed to refresh session cookie (${res.status})`,res.status); }
+        try { identity.cookies=mergeCookies(identity.cookies,getSetCookie(res)); }
+        finally { await res.body?.cancel().catch(()=>undefined); }
         return identity;
     };
 
@@ -349,153 +353,35 @@ export class BaseAPI {
         return this;
     }
 
-    /**
-     * Check if an HTTP error is transient (worth retrying).
-     * Retries on: 5xx server errors, network errors (fetch failures), and 429 rate limiting.
-     */
-    private isTransientError(statusCode: number | undefined, errorMessage?: string): boolean {
-        if (statusCode === undefined) {
-            // Network-level error (DNS, connection refused, reset, timeout)
-            return true;
+    protected async request(type:'GET'|'POST'|'PUT'|'DELETE', route:string, body?:FormData|object, callback?: (res?:string)=>object|undefined, extraHeaders?:object, policy:FetchPolicy={} ): Promise<ResponseSchema> {
+        if (this.identity===undefined) { return Promise.reject(); }
+        try {
+            if (type==='PUT') { return {type:'error',errorKind:'fatal-error',message:'PUT is not implemented'}; }
+            const isMultipart=body instanceof FormData;
+            const headers:Record<string,string>={Connection:'keep-alive',Cookie:this.identity.cookies,...extraHeaders};
+            let rawBody:any=undefined;
+            if (type==='POST') {
+                if (isMultipart) { rawBody=body; }
+                else { headers['Content-Type']='application/json'; rawBody=JSON.stringify({_csrf:this.identity.csrfToken,...body}); }
+            }
+            if (type==='DELETE') { headers['X-Csrf-Token']=this.identity.csrfToken; }
+            const res=await fetchWithPolicy(this.url+route,{method:type,redirect:'manual',headers,body:rawBody,signal:policy.signal},{...policy,idempotent:type==='GET'});
+            if (res.status===200 || res.status===201 || res.status===204) {
+                const text=res.status===204?undefined:await res.text();
+                const response=callback && callback(text);
+                return {type:'success',...response} as ResponseSchema;
+            }
+            const message=await res.text().catch(()=>res.statusText);
+            return {type:'error',errorKind:classifyResponseStatus(res.status),statusCode:res.status,message:`${res.status}: ${message}`};
+        } catch (error:any) {
+            const network=asNetworkError(error,type==='GET');
+            return {type:'error',errorKind:network.kind,statusCode:network.statusCode,message:network.message};
         }
-        // Server errors and rate limiting
-        if (statusCode >= 500 || statusCode === 429) {
-            return true;
-        }
-        // Common transient network error messages
-        if (errorMessage && (
-            errorMessage.includes('ECONNRESET') ||
-            errorMessage.includes('ETIMEDOUT') ||
-            errorMessage.includes('ECONNREFUSED') ||
-            errorMessage.includes('ENOTFOUND') ||
-            errorMessage.includes('socket hang up')
-        )) {
-            return true;
-        }
-        return false;
     }
 
-    protected async request(type:'GET'|'POST'|'PUT'|'DELETE', route:string, body?:FormData|object, callback?: (res?:string)=>object|undefined, extraHeaders?:object ): Promise<ResponseSchema> {
-        if (this.identity===undefined) { return Promise.reject(); }
-
-        const MAX_HTTP_RETRIES = 2;
-        let lastError: {statusCode?: number, message?: string} = {};
-
-        for (let attempt = 0; attempt <= MAX_HTTP_RETRIES; attempt++) {
-            try {
-                let res = undefined;
-                switch(type) {
-                    case 'GET':
-                        res = await fetch(this.url+route, {
-                            method: 'GET', redirect: 'manual',
-                            headers: {
-                                'Connection': 'keep-alive',
-                                'Cookie': this.identity!.cookies,
-                                ...extraHeaders
-                            }
-                        });
-                        break;
-                    case 'POST':
-                        const content_type = body instanceof FormData ? undefined : {'Content-Type': 'application/json'};
-                        const raw_body = body instanceof FormData ? body : JSON.stringify({
-                            _csrf: this.identity!.csrfToken,
-                            ...body
-                        });
-                        res = await fetch(this.url+route, {
-                            method: 'POST', redirect: 'manual',
-                            headers: {
-                                'Connection': 'keep-alive',
-                                'Cookie': this.identity!.cookies,
-                                ...content_type,
-                                ...extraHeaders
-                            },
-                            body: raw_body
-                        });
-                        break;
-                    case 'PUT':
-                        break;
-                    case 'DELETE':
-                        res = await fetch(this.url+route, {
-                            method: 'DELETE', redirect: 'manual',
-                            headers: {
-                                'Connection': 'keep-alive',
-                                'Cookie': this.identity!.cookies,
-                                'X-Csrf-Token': this.identity!.csrfToken,
-                                ...extraHeaders
-                            }
-                        });
-                        break;
-                };
-
-                if (res && (res.status===200 || res.status===204)) {
-                    const _res = res.status===200 ? await res.text() : undefined;
-                    const response = callback && callback(_res);
-                    return {
-                        type: 'success',
-                        ...response
-                    } as ResponseSchema;
-                } else if (res && this.isTransientError(res.status) && attempt < MAX_HTTP_RETRIES) {
-                    // Transient error: retry with backoff
-                    const delayMs = Math.min(1000 * Math.pow(2, attempt), 4000);
-                    console.log(`HTTP ${res.status} on ${route}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_HTTP_RETRIES})`);
-                    lastError = {statusCode: res.status, message: await res.text().catch(() => '')};
-                    await new Promise(r => setTimeout(r, delayMs));
-                    continue;
-                } else {
-                    const resOrFallback = res || { status:'undefined', text: async () => '' };
-                    let errorBody = '';
-                    try { errorBody = await resOrFallback.text(); } catch { errorBody = ''; }
-                    return {
-                        type: 'error',
-                        message: `${resOrFallback.status}: ${errorBody}`
-                    };
-                }
-            } catch (err: any) {
-                const errMsg = err?.message || String(err);
-                if (this.isTransientError(undefined, errMsg) && attempt < MAX_HTTP_RETRIES) {
-                    const delayMs = Math.min(1000 * Math.pow(2, attempt), 4000);
-                    console.log(`HTTP fetch error on ${route}: ${errMsg}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_HTTP_RETRIES})`);
-                    await new Promise(r => setTimeout(r, delayMs));
-                    continue;
-                }
-                return {
-                    type: 'error',
-                    message: errMsg
-                };
-            }
-        }
-
-        // All retries exhausted
-        return {
-            type: 'error',
-            message: lastError.message || `Request failed after ${MAX_HTTP_RETRIES + 1} attempts`
-        };
-    }
-
-    protected async download(route:string) {
-        if (this.identity===undefined) { return Promise.reject(); }
-
-        let content: Buffer[] = [];
-        while(true) {
-            const res = await fetch(this.url+route, {
-                method: 'GET', redirect: 'manual',
-                headers: {
-                    'Connection': 'keep-alive',
-                    'Cookie': this.identity.cookies,
-                }
-            });
-            if (res.status===200) {
-                content.push(Buffer.from(await res.arrayBuffer()));
-                break;
-            }
-            else if (res.status===206) {
-                content.push(Buffer.from(await res.arrayBuffer()));
-            } else {
-                break;
-            }
-        };
-
-        return Buffer.concat(content);
+    protected async download(route:string):Promise<Uint8Array> {
+        if (this.identity===undefined) { throw new NetworkRequestError('auth-required','Not authenticated'); }
+        return downloadBytes(this.url+route,{Connection:'keep-alive',Cookie:this.identity.cookies});
     }
 
     async logout(identity:Identity): Promise<ResponseSchema> {
@@ -581,11 +467,8 @@ export class BaseAPI {
 
     async getFile(identity:Identity, projectId:string, fileId:string) {
         this.setIdentity(identity);
-        const content = await this.download(`project/${projectId}/file/${fileId}`);
-        return {
-            type: 'success',
-            content: new Uint8Array( content )
-        };
+        try { return {type:'success' as const,content:await this.download(`project/${projectId}/file/${fileId}`)}; }
+        catch (error:any) { const network=error instanceof NetworkRequestError?error:undefined; return {type:'error' as const,errorKind:network?.kind??'fatal-error',statusCode:network?.statusCode,message:error?.message??String(error)}; }
     }
 
     async addDoc(identity:Identity, projectId:string, parentFolderId:string, filename:string) {
@@ -598,33 +481,44 @@ export class BaseAPI {
     }
 
     async uploadFile(identity:Identity, projectId:string, parentFolderId:string, filename:string, fileContent:Uint8Array) {
-        const fileStream = stream.Readable.from(fileContent);
-        const formData = new FormData();
-        const mimeType = require('mime-types').lookup(filename);
-        formData.append('targetFolderId', parentFolderId);
-        formData.append('name', filename);
-        formData.append('type', mimeType? mimeType : 'text/plain');
-        formData.append('qqfile', fileStream, {filename});
+        // Official Uppy XHRUpload uses limit: 1. Keep each project's uploads serial,
+        // including Local Replica staging uploads, without replaying failed writes.
+        const previous=this.uploadQueues.get(projectId)??Promise.resolve();
+        const task=previous.catch(()=>undefined).then(async()=>{
+            const mimeType = require('mime-types').lookup(filename);
+            const formData=createFileUploadFormData(parentFolderId,filename,mimeType||'application/octet-stream',fileContent);
 
-        this.setIdentity(identity);
-        return this.request('POST', `project/${projectId}/upload?folder_id=${parentFolderId}`, formData, (res) => {
-            const {success, entity_id, entity_type} = JSON.parse(res!) as any;
-            const entity = {_type:entity_type, _id:entity_id, name:filename} as FileEntity;
-            return {entity};
-        }, {'X-Csrf-Token': identity.csrfToken});
+            this.setIdentity(identity);
+            return this.request('POST', `project/${projectId}/upload?folder_id=${parentFolderId}`, formData, (res) => {
+                const parsed=JSON.parse(res!) as any;
+                const {success, entity_id, entity_type} = parsed;
+                if (!success || !entity_id || (entity_type!=='doc' && entity_type!=='file')) { throw new Error('Upload response did not contain a valid entity'); }
+                const responseName=parsed.name??parsed.entity_name??parsed.entity?.name;
+                if (responseName!==undefined && responseName!==filename) { throw new Error('Upload response filename did not match the request'); }
+                const entity = {_type:entity_type, _id:entity_id, name:filename} as FileEntity;
+                return {entity};
+            }, {'X-Csrf-Token': identity.csrfToken},{timeoutMs:TRANSFER_TIMEOUT_MS});
+        });
+        this.uploadQueues.set(projectId,task);
+        try { return await task; }
+        finally { if (this.uploadQueues.get(projectId)===task) { this.uploadQueues.delete(projectId); } }
     }
 
     async uploadProject(identity:Identity, filename:string, fileContent:Uint8Array) {
         const uuid = uuidv4();
-        const fileStream = stream.Readable.from(fileContent);
         const formData = new FormData();
-        formData.append('qqfile', fileStream, {filename});
+        formData.append('name',filename);
+        formData.append('qqfile',new File([Buffer.from(fileContent)],filename,{type:'application/zip'}));
 
         this.setIdentity(identity);
-        return this.request('POST', `project/new/upload?_csrf=${identity.csrfToken}&qquuid=${uuid}&qqfilename=${filename}&qqtotalfilesize=${fileContent.length}`, formData, (res) => {
-            const message = (JSON.parse(res!) as NewProjectResponseSchema).project_id;
-            return {message};
-        });
+        const params=new URLSearchParams({_csrf:identity.csrfToken,qquuid:uuid,qqfilename:filename,qqtotalfilesize:String(fileContent.length)});
+        return this.request('POST', `project/new/upload?${params}`, formData, (res) => {
+            const result=JSON.parse(res!) as {success?:boolean;project_id?:string;error?:string};
+            if (result.success!==true || typeof result.project_id!=='string' || !result.project_id) {
+                throw new Error(result.error || 'Project upload did not return a valid project ID');
+            }
+            return {message:result.project_id};
+        },{'X-Csrf-Token':identity.csrfToken},{timeoutMs:TRANSFER_TIMEOUT_MS});
     }
 
     async addFolder(identity:Identity, projectId:string, folderName:string, parentFolderId:string) {
@@ -642,11 +536,6 @@ export class BaseAPI {
         return this.request('DELETE', `project/${projectId}/${fileType}/${fileId}`);
     }
 
-    async deleteAuxFiles(identity:Identity, projectId:string) {
-        this.setIdentity(identity);
-        return this.request('DELETE', `project/${projectId}/output`);
-    }
-
     async renameEntity(identity:Identity, projectId:string, entityType:string, entityId:string, name:string) {
         this.setIdentity(identity);
         return this.request('POST', `project/${projectId}/${entityType}/${entityId}/rename`,
@@ -660,21 +549,21 @@ export class BaseAPI {
     }
 
     async compile(identity:Identity, projectId:string, rootResourcePath:string|null,
-        draft:boolean=false, stopOnFirstError:boolean=false
+        draft:boolean=false, stopOnFirstError:boolean=false, isAutoCompile=false, incremental=true, signal?:AbortSignal
     ) {
         const body = {
             check: 'silent',
             draft,
-            incrementalCompilesEnabled: true,
+            incrementalCompilesEnabled: incremental,
             rootResourcePath,   // file path e.g. "main.tex"
             stopOnFirstError
         };
 
         this.setIdentity(identity);
-        return this.request('POST', `project/${projectId}/compile?auto_compile=true`, body, (res) => {
+        return this.request('POST', `project/${projectId}/compile${isAutoCompile?'?auto_compile=true':''}`, body, (res) => {
             const compile = JSON.parse(res!) as CompileResponseSchema;
             return {compile};
-        }, {'X-Csrf-Token': identity.csrfToken});
+        }, {'X-Csrf-Token': identity.csrfToken},{timeoutMs:12*60*1000,signal});
     }
 
     async stopCompile(identity:Identity, projectId:string) {
@@ -682,16 +571,24 @@ export class BaseAPI {
         return this.request('POST', `project/${projectId}/compile/stop`, undefined, undefined, {'X-Csrf-Token': identity.csrfToken});
     }
 
-    async indexAll(identity:Identity, projectId:string) {
-        this.setIdentity(identity);
-        return this.request('POST', `project/${projectId}/references/indexAll`, {shouldBroadcast: false}, undefined);
-    }
-
     async getMetadata(identity:Identity, projectId:string) {
         this.setIdentity(identity);
         return this.request('GET', `project/${projectId}/metadata`, undefined, (res) => {
             const meta = JSON.parse(res!) as MetadataResponseScheme;
             return {meta};
+        });
+    }
+
+    async refreshDocMetadata(identity:Identity,projectId:string,docId:string,broadcast:boolean) {
+        this.setIdentity(identity);
+        return this.request('POST',`project/${projectId}/doc/${docId}/metadata`,{broadcast},res=>{
+            // Broadcasting responses are empty/"OK"; the result arrives over Socket.IO.
+            if (broadcast) { return {}; }
+            const value=JSON.parse(res!);
+            if (value?.docId!==docId || !Array.isArray(value.meta?.labels) || !value.meta?.packages) {
+                throw new Error('Document metadata response did not match the requested document');
+            }
+            return {meta:{projectId,projectMeta:{[value.docId]:value.meta}} as MetadataResponseScheme};
         });
     }
 
@@ -762,50 +659,43 @@ export class BaseAPI {
                 `?compileGroup=${encodeURIComponent(compileGroup)}` +
                 `&clsiserverid=${encodeURIComponent(clsiServerId)}` +
                 `&enable_pdf_caching=true`;
-            const content = await this._downloadAbsolute(cdnUrl, false);
-            return { type: 'success', content: new Uint8Array(content) };
+            try { return {type:'success' as const,content:await this._downloadAbsolute(cdnUrl,false)}; }
+            catch (error:any) { return {type:'error' as const,message:error?.message??String(error)}; }
         }
 
         // Fallback: download from web frontend (legacy path)
         url = url.replace(/^\/+/g, '');
         this.setIdentity(identity);
-        const content = await this.download(url);
-        return {
-            type: 'success',
-            content: new Uint8Array( content )
-        };
+        try { return {type:'success' as const,content:await this.download(url)}; }
+        catch (error:any) { return {type:'error' as const,message:error?.message??String(error)}; }
+    }
+
+    describePdf(identity:Identity,route:string,version:string,compileGroup?:string,clsiServerId?:string,pdfDownloadDomain?:string):PdfSourceDescriptor {
+        let url=this.url+route.replace(/^\/+/,''),headers:Record<string,string>={Cookie:identity.cookies};
+        if (pdfDownloadDomain && clsiServerId) {
+            const target=new URL(`${pdfDownloadDomain.replace(/\/+$/,'')}/${route.replace(/^\/+/, '')}`);
+            target.searchParams.set('compileGroup',compileGroup??'standard');
+            target.searchParams.set('clsiserverid',clsiServerId);
+            url=target.toString();headers={}; // never forward website cookies to a CDN
+        }
+        return {key:`${version}\0${url}`,open:(signal)=>PdfByteSource.open(url,headers,signal)};
     }
 
     /** Download from an absolute URL, optionally including web frontend cookies. */
-    private async _downloadAbsolute(absoluteUrl: string, includeCookies: boolean): Promise<Buffer> {
+    private async _downloadAbsolute(absoluteUrl: string, includeCookies: boolean): Promise<Uint8Array> {
         const headers: Record<string, string> = {
             'Connection': 'keep-alive',
         };
         if (includeCookies && this.identity) {
             headers['Cookie'] = this.identity.cookies;
         }
-        let content: Buffer[] = [];
-        while (true) {
-            const res = await fetch(absoluteUrl, {
-                method: 'GET', redirect: 'manual',
-                headers
-            });
-            if (res.status === 200) {
-                content.push(Buffer.from(await res.arrayBuffer()));
-                break;
-            } else if (res.status === 206) {
-                content.push(Buffer.from(await res.arrayBuffer()));
-            } else {
-                break;
-            }
-        }
-        return Buffer.concat(content);
+        return downloadBytes(absoluteUrl,headers);
     }
 
     async proxySyncPdf(identity:Identity, projectId:string, page:number, h:number, v:number, buildId:string) {
         this.setIdentity(identity);
-        const request = `project/${projectId}/sync/pdf?page=${page}&h=${h.toFixed(2)}&v=${v.toFixed(2)}&editorId=${uuidv4()}&buildId=${buildId}`;
-        return this.request('GET', `project/${projectId}/sync/pdf?page=${page}&h=${h.toFixed(2)}&v=${v.toFixed(2)}&editorId=${uuidv4()}&buildId=${buildId}`,
+        const params=new URLSearchParams({page:String(page),h:h.toFixed(2),v:v.toFixed(2),editorId:uuidv4(),buildId});
+        return this.request('GET', `project/${projectId}/sync/pdf?${params}`,
                             undefined, (res) => {
                                 const syncPdf = (JSON.parse(res!) as any).code[0] as SyncPdfResponseSchema;
                                 return {syncPdf};
@@ -814,7 +704,8 @@ export class BaseAPI {
 
     async proxySyncCode(identity:Identity, projectId:string, file:string, line:number, column:number, buildId:string) {
         this.setIdentity(identity);
-        return this.request('GET', `project/${projectId}/sync/code?file=${file}&line=${line}&column=${column}&editorId=${uuidv4()}&buildId=${buildId}`,
+        const params=new URLSearchParams({file,line:String(line),column:String(column),editorId:uuidv4(),buildId});
+        return this.request('GET', `project/${projectId}/sync/code?${params}`,
                             undefined, (res) => {
                                 const syncCode = (JSON.parse(res!) as any).pdf as SyncCodeResponseSchema;
                                 return {syncCode};
@@ -869,7 +760,8 @@ export class BaseAPI {
 
     async proxyToHistoryApiAndGetFileDiff(identity:Identity, projectId:string, pathname:string, from:number, to:number) {
         this.setIdentity(identity);
-        return this.request('GET', `project/${projectId}/diff?pathname=${pathname}&from=${from}&to=${to}`, undefined, (res) => {
+        const params=new URLSearchParams({pathname,from:String(from),to:String(to)});
+        return this.request('GET', `project/${projectId}/diff?${params}`, undefined, (res) => {
             const diff = JSON.parse(res!) as ProjectFileDiffResponseSchema;
             return {diff};
         });
@@ -885,19 +777,8 @@ export class BaseAPI {
 
     async downloadZipOfVersion(identity:Identity, projectId:string, version:number) {
         this.setIdentity(identity);
-        const content = await this.download(`project/${projectId}/version/${version}/zip`);
-        return {
-            type: 'success',
-            content: new Uint8Array(content)
-        };
-    }
-
-    async getLabels(identity:Identity, projectId:string) {
-        this.setIdentity(identity);
-        return this.request('GET', `project/${projectId}/labels`, undefined, (res) => {
-            const labels = JSON.parse(res!) as ProjectLabelResponseSchema[];
-            return {labels};
-        });
+        try { return {type:'success' as const,content:await this.download(`project/${projectId}/version/${version}/zip`)}; }
+        catch (error:any) { return {type:'error' as const,message:error?.message??String(error)}; }
     }
 
     async createLabel(identity:Identity, projectId:string, comment:string, version:number) {

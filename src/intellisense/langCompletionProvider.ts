@@ -112,6 +112,8 @@ export class CommandCompletionProvider extends IntellisenseProvider implements v
     private async getCompletionItems(uri:vscode.Uri, partial:string, wholeRange:vscode.Range): Promise<vscode.CompletionItem[]> {
         await this.load(uri);
         const {identifier} = parseUri(uri);
+        // Metadata changes arrive through the VFS cache, independently of local commands.
+        this.customData[identifier].metadata=await this.loadMetadata(uri);
 
         let commands:SnippetItemMap = {};
         this.customData[identifier].commands.forEach((item) => {

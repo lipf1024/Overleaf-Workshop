@@ -1,0 +1,17 @@
+{
+  "Mark Conflict as Resolved": "标记冲突为已解决",
+  "Mark as Resolved": "标记为已解决",
+  "Apply the merged result, clear the conflict, and resume synchronization after verification.": "应用合并结果，验证成功后清除冲突标记并恢复同步。",
+  "No unresolved Overleaf conflict was found for this file.": "此文件没有未解决的 Overleaf 冲突。",
+  "Review the merged result, then choose Mark as Resolved.": "请检查合并结果，然后点击“标记为已解决”。",
+  "Marked as resolved: {0}": "已标记为解决：{0}",
+  "Reopen Merge Editor": "重新打开合并编辑器",
+  "The merge for {0} is saved. Mark it as resolved to clear the conflict and resume synchronization.": "{0} 的合并结果已保存。点击“标记为已解决”以清除冲突标记并恢复同步。",
+  "Complete Overleaf Merge": "完成 Overleaf 合并",
+  "Save the merged result and resolve this Overleaf conflict.": "保存合并结果并解决此 Overleaf 文件的冲突。",
+  "No interrupted local replacement needs review.": "没有需要检查的本地文件替换恢复任务。",
+  "Review preserved local versions": "检查保留的本地版本",
+  "Preserved original ↔ Current local file": "保留的原文件 ↔ 当前本地文件",
+  "Keep Current File and Resume": "保留当前文件并恢复同步",
+  "Review {0}. Resuming keeps the current local file and backs up the preserved versions. Overleaf changes will be checked again before synchronization.": "请检查 {0}。恢复同步会保留当前本地文件，并备份已保留的版本。同步前会再次校验 Overleaf 的变化。"
+}

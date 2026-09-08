@@ -1,4 +1,14 @@
 {
+  "Mark Conflict as Resolved": "Mark Conflict as Resolved",
+  "Mark as Resolved": "Mark as Resolved",
+  "Apply the merged result, clear the conflict, and resume synchronization after verification.": "Apply the merged result, clear the conflict, and resume synchronization after verification.",
+  "No unresolved Overleaf conflict was found for this file.": "No unresolved Overleaf conflict was found for this file.",
+  "Review the merged result, then choose Mark as Resolved.": "Review the merged result, then choose Mark as Resolved.",
+  "Marked as resolved: {0}": "Marked as resolved: {0}",
+  "Reopen Merge Editor": "Reopen Merge Editor",
+  "The merge for {0} is saved. Mark it as resolved to clear the conflict and resume synchronization.": "The merge for {0} is saved. Mark it as resolved to clear the conflict and resume synchronization.",
+  "Complete Overleaf Merge": "Complete Overleaf Merge",
+  "Save the merged result and resolve this Overleaf conflict.": "Save the merged result and resolve this Overleaf conflict.",
   "Cookie Expired. Please Re-Login": "Cookie Expired. Please Re-Login",
   "Project Source Control": "Project Source Control",
   "Click to configure.": "Click to configure.",
@@ -108,10 +118,9 @@
   "Just now": "Just now",
   "{since_last_update} ago": "{since_last_update} ago",
   "Jump to Collaborator ...": "Jump to Collaborator ...",
-  "Upload Unsaved {number} Change(s)": "Upload Unsaved {number} Change(s)",
-  "Invisible Mode removes your presence from others' view.": "Invisible Mode removes your presence from others' view.",
-  "Back to normal mode.": "Back to normal mode.",
-  "(Experimental Feature) By entering Invisible Mode, the current connection to the server will be lost. Continue?": "(Experimental Feature) By entering Invisible Mode, the current connection to the server will be lost. Continue?",
-  "Uploading Changes": "Uploading Changes",
-  "Failed to upload": "Failed to upload"
+  "No interrupted local replacement needs review.": "No interrupted local replacement needs review.",
+  "Review preserved local versions": "Review preserved local versions",
+  "Preserved original ↔ Current local file": "Preserved original ↔ Current local file",
+  "Keep Current File and Resume": "Keep Current File and Resume",
+  "Review {0}. Resuming keeps the current local file and backs up the preserved versions. Overleaf changes will be checked again before synchronization.": "Review {0}. Resuming keeps the current local file and backs up the preserved versions. Overleaf changes will be checked again before synchronization."
 }

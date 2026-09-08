@@ -169,7 +169,7 @@ export class GlobalStateManager {
 
         if (server.login!==undefined) {
             const api = new ExtendedBaseAPI(server.url);
-            const socket = new SocketIOAPI(server.url, api, server.login.identity, projectId);
+            const socket = new SocketIOAPI(api, server.login.identity, projectId);
             return {api, socket};
         }
     }
@@ -182,7 +182,7 @@ export class GlobalStateManager {
         return scmPersists;
     }
 
-    static updateServerProjectSCMPersist(context:vscode.ExtensionContext, serverName:string, projectId:string, scmKey:string, scmPersist?:ProjectSCMPersist) {
+    static updateServerProjectSCMPersist(context:vscode.ExtensionContext, serverName:string, projectId:string, scmKey:string, scmPersist?:ProjectSCMPersist): Thenable<void> {
         const persists = context.globalState.get<ServerPersistMap>(keyServerPersists, {});
         const server   = persists[serverName];
         const project  = server.login?.projects?.find(project => project.id===projectId);
@@ -194,8 +194,9 @@ export class GlobalStateManager {
                 scmPersists[scmKey] = scmPersist;
             }
             project.scm = scmPersists;
-            context.globalState.update(keyServerPersists, persists);
+            return context.globalState.update(keyServerPersists, persists);
         }
+        return Promise.resolve();
     }
 
     static getPdfViewPersist(context:vscode.ExtensionContext, uri:string): any {

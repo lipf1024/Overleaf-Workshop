@@ -5,6 +5,7 @@ import { SocketIOAPI, UpdateUserSchema } from '../api/socketio';
 import { VirtualFileSystem } from '../core/remoteFileSystemProvider';
 import { ChatViewProvider } from './chatViewProvider';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
+import { DebouncedTasks } from '../utils/debouncedTasks';
 
 interface ExtendedUpdateUserSchema extends UpdateUserSchema {
     selection?: {
@@ -53,6 +54,32 @@ function formatTime(timestamp:number) {
 }
 
 export class ClientManager {
+    private readonly cursorTasks=new DebouncedTasks();
+    private cursorSequence=0;
+    private latestCursor?:{docId:string;row:number;column:number};
+    private cursorDelay=500;
+    get collaboratorCount():number { return Object.keys(this.onlineUsers).filter(id=>id!==this.publicId).length; }
+
+    private scheduleCursor():void {
+        this.cursorTasks.schedule('cursor',this.cursorDelay,()=>{
+            const position=this.latestCursor;
+            if (this.disposed || !this.connectedFlag || !this.socket.isReady || !position) { return; }
+            void this.socket.updatePosition(position.docId,position.row,position.column)
+                .catch(error=>console.warn('Unable to update cursor position',error));
+        });
+    }
+
+    private updateCursorDelay():void {
+        const delay=this.collaboratorCount>0?500:5*60*1000;
+        if (delay!==this.cursorDelay) {
+            this.cursorDelay=delay;
+            if (this.latestCursor) { this.scheduleCursor(); }
+        }
+    }
+
+    private registered?:vscode.Disposable[];
+    private disposed=false;
+    private readonly stopSocketHandlers:()=>void;
     private activeExists?: string;
     private inactivateTask?: NodeJS.Timeout;
     private readonly status: vscode.StatusBarItem;
@@ -67,10 +94,10 @@ export class ClientManager {
     constructor(
         private readonly vfs: VirtualFileSystem,
         private readonly context: vscode.ExtensionContext,
-        private readonly publicId: string,
+        private publicId: string,
         private readonly socket: SocketIOAPI,
     ) {
-        this.socket.updateEventHandlers({
+        this.stopSocketHandlers=this.socket.updateEventHandlers({
             onClientUpdated: (user:UpdateUserSchema) => {
                 if (user.id !== this.publicId) { this.setStatusActive(user.id); }
                 this.updatePosition(user.id, user.doc_id, user.row, user.column, user);
@@ -80,14 +107,30 @@ export class ClientManager {
             },
             onDisconnected: () => {
                 this.connectedFlag = false;
+                this.cursorSequence++;
+                this.latestCursor=undefined;
+                this.cursorTasks.dispose();
                 this.disconnectedAt = Date.now();
             },
             onConnectionAccepted: (publicId:string) => {
                 this.connectedFlag = true;
+                this.publicId=publicId;
                 this.disconnectedAt = 0;
+                this.loadConnectedUsers();
             }
         });
+        this.loadConnectedUsers();
+
+        this.chatViewer = new ChatViewProvider(this.vfs, this.publicId, this.context.extensionUri, this.socket);
+        this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
+        this.updateStatus();
+    }
+
+    private loadConnectedUsers():void {
+        const epoch=this.socket.connectionEpoch;
         this.socket.getConnectedUsers().then(users => {
+            if (this.disposed || epoch!==this.socket.connectionEpoch) { return; }
+            for (const id of Object.keys(this.onlineUsers)) { void this.removePosition(id); }
             users.forEach(user => {
                 const onlineUser = {
                     id: user.client_id,
@@ -104,11 +147,8 @@ export class ClientManager {
                     this.updatePosition(user.client_id, onlineUser.doc_id, onlineUser.row, onlineUser.column, onlineUser);
                 }
             });
-        });
-
-        this.chatViewer = new ChatViewProvider(this.vfs, this.publicId, this.context.extensionUri, this.socket);
-        this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
-        this.updateStatus();
+            this.updateCursorDelay();
+        }).catch(error=>{ if (!this.disposed) { console.warn('Unable to load collaborators',error); } });
     }
 
     private async jumpToUser(id?: string) {
@@ -183,6 +223,7 @@ export class ClientManager {
             this.onlineUsers[clientId].last_updated_at = Date.now();
         }
 
+        this.updateCursorDelay();
         const selection = this.onlineUsers[clientId].selection;
         // remove decoration
         const oldDoc = this.vfs._resolveById(this.onlineUsers[clientId]?.doc_id);
@@ -231,21 +272,15 @@ export class ClientManager {
     }
 
     private async removePosition(clientId:string) {
-        const doc = this.vfs._resolveById(this.onlineUsers[clientId]?.doc_id);
-        if (doc === undefined) { return; }
-        // const uri = this.vfs.pathToUri(doc.path);
-        const uri = (vscode.workspace.workspaceFolders?.[0].uri.scheme===ROOT_NAME) ?
-                    this.vfs.pathToUri(doc.path) : await LocalReplicaSCMProvider.pathToUri(doc.path);
-
-        const editor = uri && vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === uri.toString());
-        // delete decoration
-        const selection = this.onlineUsers[clientId].selection;
-        selection && editor?.setDecorations(selection.decoration, []);
-        // delete record
+        const user=this.onlineUsers[clientId];
+        if (!user) { return; }
         delete this.onlineUsers[clientId];
+        this.updateCursorDelay();
+        user.selection?.decoration.dispose();
     }
 
     private updateStatus() {
+        if (this.disposed) { return; }
         const count = Object.keys(this.onlineUsers).length;
         if (!this.connectedFlag) {
             const disconnectedDuration = Date.now() - this.disconnectedAt;
@@ -280,23 +315,15 @@ export class ClientManager {
             }
             this.status.command = this.chatViewer.hasUnread? `${ROOT_NAME}.collaboration.revealChatView` : `${ROOT_NAME}.collaboration.settings`;
             this.status.backgroundColor = this.chatViewer.hasUnread? new vscode.ThemeColor('statusBarItem.warningBackground') : undefined;
-            // notify unSynced changes
-            const unSynced = this.socket.unSyncFileChanges;
-            if (unSynced) {
-                prefixText = prefixText.concat(`$(arrow-up) ${unSynced} `);
-            }
-
-            const isInvisible = this.socket.isUsingAlternativeConnectionScheme;
-            const onlineIcon = isInvisible ? '$(person)' : '$(organization)';
             switch (count) {
                 case 0:
                     this.status.color = undefined;
-                    this.status.text = prefixText + `${onlineIcon} 0`;
+                    this.status.text = prefixText + '$(organization) 0';
                     this.status.tooltip = `${ELEGANT_NAME}: ${vscode.l10n.t('Online')}`;
                     break;
                 default:
                     this.status.color = this.activeExists ? this.onlineUsers[this.activeExists].selection?.color : undefined;
-                    this.status.text = prefixText + `${onlineIcon} ${count}`;
+                    this.status.text = prefixText + `$(organization) ${count}`;
                     const tooltip = new vscode.MarkdownString();
                     tooltip.appendMarkdown(`${ELEGANT_NAME}: ${this.activeExists? vscode.l10n.t('Active'): vscode.l10n.t('Idle') }\n\n`);
 
@@ -334,19 +361,10 @@ export class ClientManager {
     }
 
     collaborationSettings() {
-        const isInvisible = this.socket.isUsingAlternativeConnectionScheme;
-        const useAction = isInvisible ? 'Exit' : 'Enter';
         const quickPickItems = [
             {id:'jump', label:vscode.l10n.t('Jump to Collaborator ...'), detail:''},
             // {id:'tether', label:'Tether to Collaborator ...',detail:''},
-            {label:'',kind:vscode.QuickPickItemKind.Separator},
         ];
-        if (isInvisible && this.socket.unSyncFileChanges) {
-            quickPickItems.push({id:'sync',label:vscode.l10n.t('Upload Unsaved {number} Change(s)', {number:this.socket.unSyncFileChanges}),detail:''});
-        } else {
-            const detail = !isInvisible ? vscode.l10n.t('Invisible Mode removes your presence from others\' view.') : vscode.l10n.t('Back to normal mode.');
-            quickPickItems.push({id:'toggle',label:`${useAction} Invisible Mode`,detail});
-        }
         // show quick pick
         vscode.window.showQuickPick(quickPickItems, {
             canPickMany: false,
@@ -359,28 +377,22 @@ export class ClientManager {
                 case 'tether':
                     this.tetherToUser();
                     break;
-                case 'toggle':
-                    if (useAction==='Enter') {
-                        vscode.window.showWarningMessage( vscode.l10n.t('(Experimental Feature) By entering Invisible Mode, the current connection to the server will be lost. Continue?'), 'Yes', 'No').then(async selection => {
-                            if (selection === 'Yes') {
-                                this.vfs.toggleInvisibleMode();
-                            }
-                        });
-                    } else {
-                        this.vfs.toggleInvisibleMode();
-                    }
-                    break;
-                case 'sync':
-                    await this.socket.syncFileChanges();
-                    vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
-                    break;
             }
         });
     }
 
+    dispose():void {
+        if (this.disposed) { return; } this.disposed=true;
+        this.cursorSequence++; this.cursorTasks.dispose();
+        if (this.inactivateTask) { clearTimeout(this.inactivateTask); }
+        this.stopSocketHandlers(); this.chatViewer.dispose();
+        this.registered?.forEach(item=>item.dispose()); this.status.dispose();
+    }
+
     get triggers() {
-        return [
+        return this.registered??= [
             this.status,
+            new vscode.Disposable(()=>this.dispose()),
             // register commands
             vscode.commands.registerCommand(`${ROOT_NAME}.collaboration.insertText`, (text) => {
                 this.chatViewer.insertText(text);
@@ -399,6 +411,11 @@ export class ClientManager {
             // update this client's position
             vscode.window.onDidChangeTextEditorSelection(async e => {
                 if (e.kind===undefined) { return; }
+                const sequence=++this.cursorSequence;
+                this.cursorTasks.cancel('cursor');
+                this.latestCursor=undefined;
+                const position=e.selections[0]?.active;
+                if (!position) { return; }
                 let uri = e.textEditor.document.uri;
                 // deal with local replica
                 if (uri.scheme==='file') {
@@ -412,8 +429,9 @@ export class ClientManager {
 
                 const doc = uri && await this.vfs._resolveUri(uri);
                 const docId = doc?.fileEntity?._id;
-                if (docId) {
-                    this.socket.updatePosition(docId, e.selections[0].active.line, e.selections[0].active.character);
+                if (docId && sequence===this.cursorSequence && !this.disposed) {
+                    this.latestCursor={docId,row:position.line,column:position.character};
+                    this.scheduleCursor();
                 }
             }),
             // refresh decorations when editor is switched

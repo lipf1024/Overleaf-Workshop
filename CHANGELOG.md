@@ -1,8 +1,181 @@
 # Changelog
+
+
+## 0.16.19
+
+- Share an official-text-OT session between remote editing and initialized local replica text synchronization: compose pending operations, transform concurrent changes, and upload only at save boundaries.
+- Remove repeated full-document reads from healthy online saves. Confirm applications through both official compact `{doc,v}` acknowledgements and full source-tagged echoes, rather than treating socket callbacks as save completion.
+- Persist independent OT journals before sending; recover by version and source-aware deduplication, retry unconfirmed operations at 5 seconds, and pause after 45 seconds or a protocol mismatch. Preserve unknown submissions and conflicting offline recovery candidates.
+- Keep saved disk contents separate from unsaved editor changes; retain actual remote operation history and protect newer disk saves during acknowledgement waits.
+- Save only dirty documents belonging to the compiling project, wait for applied operations, and use finite synchronization barriers. Record content-free OT and compile-wait timings in the Overleaf OT output channel.
+- Retain binary/structural synchronization safeguards and snapshot conflict recovery. Real VS Code/Overleaf dual-client validation remains outstanding; see docs/ot-sync.md for the recovery and editor limitations.
+
+## 0.16.18
+
+- Merge all same-server Set-Cookie headers, replace existing names, honor expiration/deletion and release unused login/cookie-refresh response bodies.
+- Encode history diff queries with URLSearchParams, preserving Unicode, spaces, ampersands, fragments and other reserved characters in filenames.
+- Load PDFs through an authenticated extension-host byte-range transport: 64 KiB blocks, strong ETag / If-Range validation, overlapping-request coalescing, cached blocks and retries limited to failed blocks.
+- Reuse the same build in an open preview, cancel downloads on document disposal and retain the displayed source until its replacement loads. Cookies and download URLs are not sent to the webview.
+- Fall back to verified full downloads when the server ignores Range, encodes partial responses, or lacks a strong validator. Generic ZIP/binary downloads keep their existing behavior.
+- Validate with the bundled PDF.js: first-page text from a 2,097,811-byte fixture requires 131,731 transferred bytes over 3 range requests. This is a controlled fixture, not an Overleaf production benchmark.
+
+
+## 0.16.17
+
+- Align spelling scheduling with the official 1-second debounce; skip obsolete queued document versions and cancel pending checks on close/disposal.
+- Debounce cursor updates by collaborator presence (500 ms / 5 minutes), refresh connected users after reconnect, and discard stale cursor work.
+- Cache and coalesce project metadata reads; update from broadcastDocMeta and debounced per-document metadata requests, including Local Replica text writes.
+- Serialize file uploads per project; pause automatic builds after server autocompile-backoff until a successful manual build.
+- Honor forceDisconnect with delayed shutdown and manual Retry Connection; use the official active-client 3–9 second reconnect jitter with the existing five-attempt cap.
+- Audit all 52 HTTP wrappers, 6 Socket.IO messages and Local Replica scheduling in docs/request-frequency-audit.md. Record retained save semantics and remaining Hunspell, PDF transport, retry and subscription differences explicitly.
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.16.16] - 2026-09-08
+
+### Fixed
+- Use a dedicated 10-minute budget for file/PDF/ZIP transfers and uploads, preserve caller cancellation in the network layer, and respect longer Retry-After delays.
+- Include the project name in ZIP import form data, encode upload query parameters, and reject invalid project-upload results.
+- Stop calling unsupported legacy spelling services after one explicit warning. Failed checks no longer mark words as correct; queued checks reuse successful results. Modern Overleaf browser-side Hunspell is not yet embedded in the extension.
+
+
+### Removed
+- Remove unused HTTP request wrappers for auxiliary-cache deletion, full reference indexing, and history-label listing; update the network inventory.
+
+## [0.16.15] - 2026-09-08
+
+### Fixed
+- Give compile requests a dedicated 12-minute client timeout and cancellation, preserve unknown outcomes without replaying queued requests, and distinguish manual from automatic compilation.
+- Preserve remote auxiliary caches during ordinary compilation and fall back to non-incremental compilation after server errors.
+- Publish logs and specific failure states even when compilation or PDF downloading fails, while keeping the previous PDF visible.
+- Use one-based SyncTeX line numbers and encode query parameters correctly.
+- Read login error messages from the official response shape and handle HTTP/JSON login redirects safely.
+
+## [0.16.14] - 2026-09-08
+
+### Fixed
+- Show explicit Normal / Draft choices in Compile Mode and immediately recompile the selected project after confirmation.
+
+## [0.16.13] - 2026-09-08
+
+### Fixed
+- Allow PDF previews to open before compile outputs exist, and compile after registering the preview so it receives the generated PDF.
+- Replace remaining hardcoded Chinese synchronization and PDF progress messages with English.
+
+## [0.16.12] - 2026-09-08
+
+### Changed
+- Label the status-bar switch Auto Sync: On / Off, with Overleaf and the project name in its tooltip.
+- Consolidate project opening into remote (cloud) and local (desktop) actions in the project toolbar and context menu. Both offer Current Window / New Window before opening.
+
+## [0.16.11] - 2026-09-07
+
+### Changed
+- Saving only triggers automatic compilation while that project's PDF preview is open. Closing the preview also skips queued automatic builds; explicit manual compilation remains available.
+- Add an auto-sync on/off switch to the status bar and keep Sync Now available in the Explorer toolbar in either state. Repeated Sync Now requests share the active synchronization run.
+- Show local synchronization activity above the Explorer file tree with a status-bar task count.
+- Keep the previous PDF visible beneath a loading overlay during synchronization, compilation and PDF loading. Clear busy state on completion, cancellation or failure, and preserve cached PDF data when downloads fail.
+
+## [0.16.10] - 2026-09-07
+
+### Changed
+- Local compile preparation reuses content confirmed on the current live connection, avoiding a redundant remote read after synchronization. Changed files still require verified upload; reconnects, uncertain state and conflicts retain strict checks.
+
+## [0.16.9] - 2026-09-06
+
+### Changed
+- Local compile-on-save starts immediately and synchronizes the saved path instead of rescanning the whole replica. Saves during a build coalesce into one follow-up build, manual compilation takes priority, and stopping compilation clears queued work.
+- Successful builds refresh an open PDF before compiler diagnostics are parsed, reducing perceived preview latency.
+
+## [0.16.8] - 2026-09-06
+
+### Fixed
+- Local-replica text and binary changes now mark the remote project dirty only after the mutation is verified, so compile-on-save rebuilds and refreshes an open PDF reliably.
+- Local compile-on-save requests debounce for 300 ms. Saves during a build coalesce into one follow-up build, manual compilation takes priority, and stopping compilation clears queued work.
+
+### Documentation
+- Rewrote the main README in Chinese around installation, remote and local workflows, conflict resolution, compilation, PDF preview, and all Common, Local Replica, and Remote Project settings.
+
+## [0.16.7] - 2026-09-06
+
+### Fixed
+- Settings are grouped as Common, Local Replica, and Remote Project. Removed inactive local-sync placeholders and exposed local compile/PDF preview as a live per-folder setting, with automatic migration from the legacy `.overleaf/settings.json` value.
+- B01: Remote document saves retain a separate editor baseline, refresh invalidated transport caches, and reject missing baselines, conflicts, and unconfirmed writes. Successive saves preserve changes merged from Overleaf.
+- B02/B05: Scanning, watchers, retries, moves, and recovery share path and ignore checks. Symlinks, changed ancestors, and replaced metadata directories stop access; ignored records keep their recovery data without participating in synchronization.
+- B03/B04: OS file locks give one window synchronization ownership per real replica root. Local writes, moves, and deletions journal their stages, capture the actual replaced file, and install without overwriting a recreated target. Observers can read state and edit ordinary files; takeover recovers the journal before synchronization.
+- Removed the experimental Invisible Mode, including its REST polling transport, staged force-upload path, settings, UI, tests, and documentation. Project sessions now use the supported Socket.IO v1/v2 transports only.
+- B07/B08/B12: Compile operations release their guard on every outcome, check saved and published local changes, and keep diagnostics and PDF navigation tied to the originating project. Complete connection initialization has a five-attempt limit, explicit retry, cancellation, and resource cleanup.
+- B10/B11: Combined moves and renames preserve entity IDs and refresh the tree after partial failure; overwrite targets are backed up. Downloads validate encoded lengths and strict decompression independently, with range and ETag checks retained.
+- B13: Merge drafts debounce at 250 ms with a 1 s maximum wait and flush on save, close, resolution, and shutdown. Object collection protects bases, conflicts, drafts, journals, open sessions, and active work; incomplete recovery retains its data.
+
+- Restored the PDF.js viewer and LaTeX language resources in the local package; prepublish now rejects missing runtime assets or an unapplied rendering patch.
+
+### Added
+- **Local Replica: Review Recovery Files** to compare preserved originals and explicitly resume using the current local file after a concurrent replacement.
+- Regression coverage using real temporary files, multiple processes, interrupted journal phases, network failures, Unicode, and multiple project contexts.
+
+### Migration
+- Close old synchronization windows before enabling this version. State remains schema 1; journals use schema 3. See `UPGRADING_0.16.7.md`.
+- The **Mark as Resolved** text button remains in the native Result pane and still requires `contribEditorContentMenu`. This is a local VSIX build, not a Marketplace release. Real window interaction remains unverified because the isolated launch was rejected by the approval service; see `NATIVE_MERGE_BUTTON.md`.
+
+## [0.16.6] - 2026-09-06
+
+### Added
+- A labeled **Mark as Resolved** button inside the native merge editor's Result pane, using the same `editor/content` contribution as VS Code's Git merge button. It appears only for Overleaf merge results.
+- This local build requires VS Code to enable the `contribEditorContentMenu` proposed API for `lipf1024.overleaf-workshop`. Installing the VSIX alone does not enable the in-page button. See `NATIVE_MERGE_BUTTON.md` for the exact runtime setting; proposed APIs are not supported for Marketplace publishing.
+
+### Fixed
+- The in-page button invokes the verified conflict-resolution path and respects VS Code's remaining-conflict confirmation.
+
+## [0.16.5] - 2026-09-06
+
+### Fixed
+- Added an explicit **Mark as Resolved** action to each conflicted file in Source Control and the Explorer context menu, with matching Chinese labels and a status bar button.
+- Saved merge results can be marked as resolved after closing the merge editor or restarting VS Code. The action applies the selected file's result and clears its conflict only after synchronization is verified.
+- Newer input versions require review; cancelling native merge completion, unresolved markers, and failed remote verification keep the conflict pending.
+
+## [0.16.4] - 2026-09-06
+
+### Fixed
+- Added a labeled Complete Overleaf Merge button in the status bar, with matching editor toolbar, context-menu, and Command Palette actions. The completion entry no longer depends on the native Git merge button or editor-scoped context keys.
+- Completion actions invoked from an input pane or a reopened draft target the correct merge result and wait for the native editor to finish loading.
+- Added Chinese completion labels and clarified the conflict-resolution instructions.
+
+## [0.16.3] - 2026-09-06
+
+### Added
+- Conflict warnings after startup, conflict-colored Explorer/editor decorations, a conflict count in the status bar, and Source Control resolution actions.
+
+### Changed
+- Replaced the custom conflict page with VS Code's native three-way merge editor, persistent drafts, and read-only input snapshots.
+
+### Fixed
+- Unresolved conflicts remain marked and excluded from synchronization across saves, manual syncs, read failures, and restarts until explicitly resolved.
+- Saving or closing a merge draft does not resolve or upload it; applying a draft rechecks the exact versions shown in the merge editor.
+
+## [0.16.0] - 2026-09-05
+
+### Added
+- Safe bidirectional local-replica synchronization with persistent SHA-256 bases, atomic journals, backups, recovery, and verified remote revisions.
+- Incoming, Outgoing, and Conflicts source-control groups plus a persistent three-pane conflict editor.
+- Manual synchronization mode, stable external-change monitoring, diagnostics, retry, and explicit conflict-resolution commands.
+
+### Changed
+- Replaced the legacy overwrite and time-window cache path with deterministic three-way reconciliation.
+- Local compilation now pauses when local-replica changes have not reached Overleaf.
+- Local-replica metadata, temporary files, symbolic links, unsafe paths, and macOS path collisions are excluded or frozen safely.
+- Raised the minimum VS Code version to 1.101 and pinned Undici 7.29.0 for the Node 22 extension host.
+- Replaced npm `form-data` uploads with WHATWG multipart bodies and strict response validation.
+
+### Fixed
+- Network, authentication, timeout, redirect, truncated-download, and unknown-mutation outcomes can no longer masquerade as a missing or empty remote file.
+- Socket readiness now requires a completed project join and refresh; stale epochs, duplicate reconnect work, listener timers, reconnect-time SCM recreation, and reconnect-time compilation are suppressed.
+- Binary replacement uses a verified temporary entity and recoverable journal stages instead of destructive overwrite.
+- Baselines are committed only after matching local and remote hashes, a verified revision, and a stable connection epoch.
+- Missing or corrupt baseline objects, local I/O failures, and cross-epoch snapshot reads now freeze synchronization instead of being interpreted as deletion.
+- Adopting the Overleaf side of a conflict no longer performs a redundant remote write, and unknown staged binary uploads cannot be replayed by later file events.
 
 ## [0.15.10] - 2026-07-11
 ### Changed

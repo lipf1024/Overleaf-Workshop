@@ -3,6 +3,7 @@ import { IntellisenseProvider } from '.';
 import { ROOT_NAME } from '../consts';
 import { VirtualFileSystem } from '../core/remoteFileSystemProvider';
 import { EventBus } from '../utils/eventBus';
+import { DebouncedTasks } from '../utils/debouncedTasks';
 
 function* sRange(start:number, end:number) {
     for (let i = start; i <= end; i++) {
@@ -11,6 +12,9 @@ function* sRange(start:number, end:number) {
 }
 
 export class MisspellingCheckProvider extends IntellisenseProvider implements vscode.CodeActionProvider {
+    private checkQueue:Promise<void>=Promise.resolve();
+    private checkGeneration=0;
+    private readonly scheduledChecks=new DebouncedTasks();
     private learnedWords?: Set<string>;
     private suggestionCache: Map<string, string[]> = new Map();
     private diagnosticCollection = vscode.languages.createDiagnosticCollection(ROOT_NAME);
@@ -20,10 +24,24 @@ export class MisspellingCheckProvider extends IntellisenseProvider implements vs
         return text.split(/([\P{L}\p{N}]*\\[a-zA-Z]*|[\P{L}\p{N}]+)/gu);
     }
 
-    private async check(uri:vscode.Uri, changedText: string) {
+    private check(uri:vscode.Uri,changedText:string,document?:vscode.TextDocument):Promise<void> {
+        const generation=this.checkGeneration,version=document?.version;
+        const current=()=>generation===this.checkGeneration && (!document || (!document.isClosed && document.version===version));
+        const task=this.checkQueue.then(async()=>{
+            if (!current()) { return; }
+            await this.checkWords(uri,document?document.getText():changedText);
+            if (document && current()) { await this.updateDiagnostics(uri); }
+        });
+        this.checkQueue=task.catch(()=>undefined);
+        return task;
+    }
+
+    private async checkWords(uri:vscode.Uri, changedText: string) {
+        const generation=this.checkGeneration;
         // init learned words
         if (this.learnedWords===undefined) {
             const vfs = await this.vfsm.prefetch(uri);
+            if (generation!==this.checkGeneration) { return; }
             const words = vfs.getDictionary();
             this.learnedWords = new Set(words);
         }
@@ -39,7 +57,10 @@ export class MisspellingCheckProvider extends IntellisenseProvider implements vs
 
         // update suggestion cache and learned words
         const vfs = await this.vfsm.prefetch(uri);
+        if (generation!==this.checkGeneration) { return; }
         const misspellings = await vfs.spellCheck(uri, uniqueWordsArray);
+        if (!Array.isArray(misspellings) || generation!==this.checkGeneration) { return; }
+        if (!misspellings.every(item=>Number.isInteger(item.index) && item.index>=0 && item.index<uniqueWordsArray.length && Array.isArray(item.suggestions))) { return; }
         if (misspellings) {
             misspellings.forEach(misspelling => {
                 uniqueWords.delete(uniqueWordsArray[misspelling.index]);
@@ -95,13 +116,21 @@ export class MisspellingCheckProvider extends IntellisenseProvider implements vs
         this.diagnosticCollection.set(uri, diagnostics);
     }
 
-    private resetDiagnosticCollection() {
-        this.diagnosticCollection.clear();
-        vscode.workspace.textDocuments.forEach(async doc => {
-            const uri = doc.uri;
-            await this.check( uri, doc.getText() );
-            this.updateDiagnostics(uri);
+    // Official SpellChecker.scheduleSpellCheck uses a 1000 ms trailing debounce.
+    // Read the latest document after the queue drains; never send queued typing prefixes.
+    private scheduleCheck(document:vscode.TextDocument,delay=1000):void {
+        const key=document.uri.toString();
+        this.scheduledChecks.schedule(key,delay,()=>{
+            void this.check(document.uri,'',document).catch(error=>console.warn('Spell check failed',error));
         });
+    }
+
+    private resetDiagnosticCollection() {
+        this.scheduledChecks.dispose();
+        this.diagnosticCollection.clear();
+        for (const doc of vscode.workspace.textDocuments) {
+            if (doc.uri.scheme===ROOT_NAME) { this.scheduleCheck(doc,0); }
+        }
     }
 
     provideCodeActions(document: vscode.TextDocument, range: vscode.Range, context: vscode.CodeActionContext, token: vscode.CancellationToken): vscode.ProviderResult<vscode.CodeAction[]> {
@@ -198,6 +227,11 @@ export class MisspellingCheckProvider extends IntellisenseProvider implements vs
         return [
             // the diagnostic collection
             this.diagnosticCollection,
+            new vscode.Disposable(()=>{ this.checkGeneration++; this.scheduledChecks.dispose(); }),
+            vscode.workspace.onDidCloseTextDocument(doc=>{
+                this.scheduledChecks.cancel(doc.uri.toString());
+                this.diagnosticCollection.delete(doc.uri);
+            }),
             // the code action provider
             vscode.languages.registerCodeActionsProvider(this.selector, this),
             // register learn spelling command
@@ -209,41 +243,18 @@ export class MisspellingCheckProvider extends IntellisenseProvider implements vs
             }),
             // reset diagnostics when spell check languages changed
             EventBus.on('spellCheckLanguageUpdateEvent', async () => {
-                this.learnedWords?.clear();
+                this.checkGeneration++;
+                this.learnedWords=undefined;
                 this.suggestionCache.clear();
                 this.resetDiagnosticCollection();
             }),
-            // update diagnostics on document open
-            vscode.workspace.onDidOpenTextDocument(async doc => {
-                if (doc.uri.scheme === ROOT_NAME) {
-                    const uri = doc.uri;
-                    await this.check( uri, doc.getText() );
-                    this.updateDiagnostics(uri);
-                }
+            // Initial open is immediate; typing is coalesced until one second idle.
+            vscode.workspace.onDidOpenTextDocument(doc => {
+                if (doc.uri.scheme===ROOT_NAME) { this.scheduleCheck(doc,0); }
             }),
-            // update diagnostics on text changed
-            vscode.workspace.onDidChangeTextDocument(async e => {
-                if (e.document.uri.scheme === ROOT_NAME) {
-                    const uri = e.document.uri;
-                    for (const event of e.contentChanges) {
-                        // extract changed text
-                        const startLine = Math.max(0, event.range.start.line-1);
-                        const [endLine, maxLength] = (() => {
-                            try {
-                                const _line = event.range.end.line;
-                                return [_line, e.document.lineAt(_line).text.length];
-                            } catch {
-                                return [event.range.end.line+1, 0];
-                            }
-                        })();
-                        let _range = new vscode.Range(startLine, 0, endLine, maxLength);
-                        _range = e.document.validateRange(_range);
-                        // update diagnostics
-                        const changedText = [...sRange(_range.start.line, _range.end.line)]
-                                            .map(i => e.document.lineAt(i).text).join(' ');
-                        await this.check( uri, changedText );
-                        this.updateDiagnostics(uri, _range);
-                    };
+            vscode.workspace.onDidChangeTextDocument(e => {
+                if (e.document.uri.scheme===ROOT_NAME && e.contentChanges.length) {
+                    this.scheduleCheck(e.document);
                 }
             }),
         ];

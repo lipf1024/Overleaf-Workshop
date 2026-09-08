@@ -8,6 +8,10 @@ import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     private hasUnreadMessages = 0;
     private webviewView?: vscode.WebviewView;
+    private readonly stopSocketHandlers:()=>void;
+    private registered?:vscode.Disposable[];
+    private disposed=false;
+    private webviewMessages?:vscode.Disposable;
 
     constructor(
         private readonly vfs: VirtualFileSystem,
@@ -15,7 +19,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         private readonly extensionUri: vscode.Uri,
         private readonly socket: SocketIOAPI,
     ) {
-        this.socket.updateEventHandlers({
+        this.stopSocketHandlers=this.socket.updateEventHandlers({
             onReceivedMessage: this.onReceivedMessage.bind(this)
         });
     }
@@ -38,9 +42,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     resolveWebviewView(webviewView: vscode.WebviewView, context: vscode.WebviewViewResolveContext<unknown>, token: vscode.CancellationToken): Thenable<void> {
         this.webviewView = webviewView;
         return this.loadWebviewHtml(webviewView.webview).then((html) => {
+            if (this.disposed) { return; }
             webviewView.webview.options = {enableScripts:true};
             webviewView.webview.html = html;
-            webviewView.webview.onDidReceiveMessage((e) => {
+            this.webviewMessages?.dispose();
+            this.webviewMessages=webviewView.webview.onDidReceiveMessage((e) => {
+                if (this.disposed) { return; }
                 switch (e.type) {
                     case 'get-messages': this.getMessages(); break;
                     case 'send-message': this.sendMessage(e.content); break;
@@ -131,8 +138,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
+    dispose():void {
+        if (this.disposed) { return; } this.disposed=true;
+        this.stopSocketHandlers(); this.webviewMessages?.dispose(); this.registered?.forEach(item=>item.dispose()); this.webviewView=undefined;
+    }
+
     get triggers() {
-        return [
+        return this.registered??= [
             // register commands
             vscode.commands.registerCommand(`${ROOT_NAME}.collaboration.copyLineRef`, () => {
                 const ref = this.getLineRef();

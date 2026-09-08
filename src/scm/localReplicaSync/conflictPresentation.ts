@@ -1,0 +1,78 @@
+import * as vscode from 'vscode';
+import { FileSyncRecord } from './model';
+import { ConflictNotificationTracker, hasUnresolvedConflict } from './conflictState';
+
+export class ConflictPresentation implements vscode.FileDecorationProvider, vscode.Disposable {
+    private readonly changed=new vscode.EventEmitter<vscode.Uri[]>();
+    readonly onDidChangeFileDecorations=this.changed.event;
+    private readonly registration=vscode.window.registerFileDecorationProvider(this);
+    private readonly status=vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left,100);
+    private readonly notifications=new ConflictNotificationTracker();
+    private decorations=new Map<string,vscode.FileDecoration>();
+    private records:FileSyncRecord[]=[];
+    private notificationTimer?:ReturnType<typeof setTimeout>;
+    private disposed=false;
+
+    constructor(private readonly root:vscode.Uri,private readonly openConflict:(id?:string)=>Promise<void>) {
+        this.status.name='Overleaf conflicts';
+        this.status.command='overleaf-workshop.localReplica.reviewPending';
+        this.status.backgroundColor=new vscode.ThemeColor('statusBarItem.errorBackground');
+        this.status.color=new vscode.ThemeColor('statusBarItem.errorForeground');
+    }
+
+    update(records:FileSyncRecord[],ready:boolean):void {
+        this.records=records;
+        const conflicts=records.filter(hasUnresolvedConflict);
+        const previous=this.decorations;
+        this.decorations=new Map(conflicts.map(record=>[
+            vscode.Uri.joinPath(this.root,record.path).toString(),
+            {
+                badge:'!',
+                color:new vscode.ThemeColor('gitDecoration.conflictingResourceForeground'),
+                tooltip:'Overleaf conflict — synchronization paused. '+(record.message??'Resolve the conflict to resume synchronization.'),
+                propagate:true,
+            },
+        ]));
+        const affected=new Set([...previous.keys(),...this.decorations.keys()]);
+        this.changed.fire([...affected].map(uri=>vscode.Uri.parse(uri)));
+        if (conflicts.length) {
+            this.status.text='$(warning) Overleaf: '+conflicts.length+(conflicts.length===1?' conflict':' conflicts');
+            this.status.tooltip='Synchronization is paused for conflicted files. Click to review them in Source Control.';
+            this.status.show();
+        } else { this.status.hide(); }
+
+        if (!ready) { this.notifications.takeNew(records,false); return; }
+        if (!this.notificationTimer) {
+            this.notificationTimer=setTimeout(()=>{
+                this.notificationTimer=undefined;
+                void this.notify().catch(error=>console.error('Overleaf conflict notification failed',error));
+            },200);
+        }
+    }
+
+    provideFileDecoration(uri:vscode.Uri):vscode.FileDecoration|undefined {
+        return this.decorations.get(uri.toString());
+    }
+
+    private async notify():Promise<void> {
+        const fresh=this.notifications.takeNew(this.records,true);
+        if (!fresh.length || this.disposed) { return; }
+        const message=fresh.length===1
+            ? 'Overleaf conflict: '+fresh[0].path+'. Synchronization for this file is paused until you resolve it.'
+            : fresh.length+' Overleaf files have conflicts. Synchronization for these files is paused until you resolve them.';
+        const resolvable=fresh.find(record=>record.pendingConflictId);
+        const actions=resolvable?['Open Merge Editor','Show Conflicts']:['Show Conflicts'];
+        const choice=await vscode.window.showWarningMessage(message,...actions);
+        if (this.disposed) { return; }
+        if (choice==='Open Merge Editor') { await this.openConflict(resolvable?.pendingConflictId); }
+        if (choice==='Show Conflicts') { await vscode.commands.executeCommand('workbench.view.scm'); }
+    }
+
+    dispose():void {
+        this.disposed=true;
+        if (this.notificationTimer) { clearTimeout(this.notificationTimer); }
+        this.registration.dispose();
+        this.changed.dispose();
+        this.status.dispose();
+    }
+}

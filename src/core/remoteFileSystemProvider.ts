@@ -1,6 +1,5 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
-import * as DiffMatchPatch from 'diff-match-patch';
 import { BaseAPI, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
@@ -9,6 +8,17 @@ import { ClientManager } from '../collaboration/clientManager';
 import { EventBus } from '../utils/eventBus';
 import { SCMCollectionProvider } from '../scm/scmCollectionProvider';
 import { ExtendedBaseAPI, ProjectLinkedFileProvider, UrlLinkedFileProvider } from '../api/extendedBase';
+import { ApplyResult, JournalEntry, RemoteRevision, RemoteSnapshot } from '../scm/localReplicaSync/model';
+import { contentHash } from '../scm/localReplicaSync/hash';
+import { NetworkRequestError } from '../api/network';
+import { createHash, randomUUID } from 'crypto';
+import { SyncStateStore } from '../scm/localReplicaSync/stateStore';
+import { OtDocuments } from './ot/documents';
+import { OtSession } from './ot/session';
+import { OtEditor } from './ot/editor';
+import { TextOperation } from './ot/text';
+import { ProjectMetadataCache } from './projectMetadataCache';
+import { DebouncedTasks } from '../utils/debouncedTasks';
 
 const __OUTPUTS_ID = `${ROOT_NAME}-outputs`;
 
@@ -115,15 +125,34 @@ export class VirtualFileSystem extends vscode.Disposable {
     private publicId?: string;
     private userId: string;
     private isDirty: boolean = true;
+    private editorBases=new Map<string,string>();
+    private editorWrites=new Map<string,Promise<void>>();
+    private otDocuments?:OtDocuments;
+    private otEditors=new Map<string,OtEditor>();
+    private otOutput?:vscode.OutputChannel;
+    private otListeners=new Set<(id:string,op?:TextOperation)=>void>();
+    private otLifecycle:vscode.Disposable[]=[];
     private initializing?: Promise<ProjectEntity>;
+    private initializationActive=false;
+    private static runtimeUiOwner?:VirtualFileSystem;
     private retryConnection: number = 0;
+    private reconnectError?:Error;
+    private reconnectAbort?:AbortController;
+    private remoteTreeWrites:Promise<unknown>=Promise.resolve();
     private retryTimer?: NodeJS.Timeout;
-    /** Whether a "Reconnecting..." notification is currently shown */
-    private reconnectingNotification: boolean = false;
-    /** Timestamp of last disconnect for debounce */
-    private lastDisconnectTime: number = 0;
+    private reconnectingStatus?: vscode.Disposable;
+    private disposed = false;
     /** Whether event handlers have been registered on the current socket */
     private handlersRegistered: boolean = false;
+    private runtimeInitialized=false;
+    private disconnectedTree?:Map<string,{path:string;signature:string}>;
+    private readonly snapshotReads=new Map<string,Promise<RemoteSnapshot|undefined>>();
+    private refreshTreePromise?:Promise<void>;
+    private metadataCache?:ProjectMetadataCache;
+    private metadataTasks?:DebouncedTasks;
+    private readonly metadataRunning=new Set<string>();
+    private metadataRefreshUnavailable=false;
+    private get projectMetadata():ProjectMetadataCache { return this.metadataCache??=new ProjectMetadataCache(); }
     private outputBuildId?: string;
     private compileGroup?: string;
     private clsiServerId?: string;
@@ -137,9 +166,23 @@ export class VirtualFileSystem extends vscode.Disposable {
     public readonly serverName: string;
     public readonly projectId: string;
 
-    constructor(context: vscode.ExtensionContext, uri: vscode.Uri, notify: (events:vscode.FileChangeEvent[])=>void) {
+    constructor(context: vscode.ExtensionContext, uri: vscode.Uri, notify: (events:vscode.FileChangeEvent[])=>void, onDispose?:()=>void) {
         // define the dispose behavior
         super(() => {
+            this.disposed = true;
+            this.otDocuments?.dispose();
+            this.otEditors?.forEach(editor=>editor.dispose());
+            this.otLifecycle?.forEach(listener=>listener.dispose());
+            this.otOutput?.dispose();
+            this.metadataTasks?.dispose();
+            this.metadataCache?.reset();
+            if (VirtualFileSystem.runtimeUiOwner===this) { VirtualFileSystem.runtimeUiOwner=undefined; }
+            this.reconnectAbort?.abort();
+            if (this.retryTimer) {
+                clearTimeout(this.retryTimer);
+                this.retryTimer = undefined;
+            }
+            this.closeReconnectingProgress();
             // dispose all triggers of clientManager
             this.clientManagerItem?.triggers.forEach((trigger) => trigger.dispose());
             this.clientManagerItem = undefined;
@@ -147,7 +190,8 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.scmCollectionItem?.triggers.forEach((trigger) => trigger.dispose());
             this.scmCollectionItem = undefined;
             // disconnect socketio
-            // this.socket.disconnect();
+            this.socket.dispose();
+            onDispose?.();
         });
 
         const {userId,projectId,serverName,projectName} = parseUri(uri);
@@ -158,6 +202,12 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.projectId = projectId;
         this.context = context;
         this.notify = notify;
+        this.otLifecycle.push(vscode.workspace.onDidOpenTextDocument(document=>{
+            if (document.uri.scheme!==ROOT_NAME || parseUri(document.uri).projectId!==this.projectId || document.uri.authority!==this.serverName) { return; }
+            void this.textSession(document.uri).then(session=>{ if (session) { this.bindOtEditor(document,session); } }).catch(()=>undefined);
+        }),vscode.workspace.onDidCloseTextDocument(document=>{
+            const key=document.uri.toString(); this.otEditors.get(key)?.dispose(); this.otEditors.delete(key);
+        }));
 
         const res = GlobalStateManager.initSocketIOAPI(this.context, this.serverName, projectId);
         if (res) {
@@ -172,151 +222,156 @@ export class VirtualFileSystem extends vscode.Disposable {
         return this.userId;
     }
 
+    get isDisposed() {
+        return this.disposed;
+    }
+
+    get connectionEpoch():number { return this.socket.connectionEpoch; }
+    get isConnectionReady():boolean { return this.socket.isReady; }
+
+    private async refreshProjectTree():Promise<void> {
+        if (this.refreshTreePromise) { return this.refreshTreePromise; }
+        // A normal reconnect already owns connect/join while the tree is absent.
+        // Reuse it instead of starting a competing socket epoch.
+        if (!this.root && this.initializing) { await this.initializing; return; }
+        const previous=this.treeIndex(this.root);
+        this.metadataTasks?.dispose();
+        this.metadataCache?.reset();
+        const refreshTask=(async():Promise<ProjectEntity>=>{
+            this.socket.init();
+            const project=await this.socket.joinProject(this.projectId);
+            project.settings=await this.fetchProjectSettings();
+            this.root=project; this.socket.completeProjectRefresh();
+            this.publishReconnectTreeChanges(previous,this.treeIndex(project));
+            return project;
+        })();
+        // Hide the stale pre-refresh tree. Any concurrent resolver now shares the
+        // same project join through init() rather than reading obsolete entities.
+        this.root=undefined;
+        this.initializing=refreshTask;
+        const completion=refreshTask.then(()=>undefined).finally(()=>{
+            if (this.initializing===refreshTask) { this.initializing=undefined; }
+            if (this.refreshTreePromise===completion) { this.refreshTreePromise=undefined; }
+        });
+        this.refreshTreePromise=completion;
+        return completion;
+    }
+
+    private async fetchProjectSettings():Promise<ProjectSettingsSchema> {
+        const identity=await GlobalStateManager.authenticate(this.context,this.serverName);
+        const response=await this.api.getProjectSettings(identity,this.projectId);
+        if (response.type!=='success' || !response.settings) {
+            throw new NetworkRequestError(response.errorKind??'fatal-error',response.message??'Project refresh returned no settings',response.statusCode);
+        }
+        return response.settings;
+    }
+
     async init() : Promise<ProjectEntity> {
+        if (this.disposed) {
+            throw new Error('Cannot initialize a disposed virtual file system');
+        }
         if (this.root) {
             return Promise.resolve(this.root);
         }
 
+        if (this.reconnectError) { throw this.reconnectError; }
         if (!this.initializing) {
             this.initializing = this.initializingPromise;
         }
         return this.initializing;
     }
 
-    private get initializingPromise(): Promise<ProjectEntity> {
-        const MAX_RETRIES = 5;
-        const BASE_DELAY_MS = 1000; // 1 second base delay
-
-        // if retry connection exhausted, show error
-        if (this.retryConnection >= MAX_RETRIES) {
-            this.retryConnection = 0;
-            this.initializing = undefined;
-            this.reconnectingNotification = false;
-            vscode.window.showErrorMessage(
-                vscode.l10n.t('Connection lost: {serverName}', {serverName:this.serverName}),
-                vscode.l10n.t('Reload'),
-                vscode.l10n.t('Retry'),
-            ).then((choice) => {
-                if (choice === vscode.l10n.t('Reload')) {
-                    vscode.commands.executeCommand("workbench.action.reloadWindow");
-                } else if (choice === vscode.l10n.t('Retry')) {
-                    this.retryConnection = 0;
-                    this.handlersRegistered = false;
-                    this.socket.init(); // Recreate socket after all auto-reconnect attempts exhausted
-                    this.initializing = this.initializingPromise;
-                    this.init().catch(() => {});
-                }
-            });
-            throw new Error( vscode.l10n.t('Connection lost') );
+    public async createLocalReplica(baseUri: vscode.Uri): Promise<vscode.Uri> {
+        await this.init();
+        const collection = this.scmCollectionItem?.collection;
+        if (!collection) {
+            throw new Error(vscode.l10n.t('Local replica source control is not available.'));
         }
+        return collection.createLocalReplica(baseUri);
+    }
 
-        // exponential backoff delay: 1s, 2s, 4s, 8s, 16s
-        const delayMs = this.retryConnection > 0 ? Math.min(BASE_DELAY_MS * Math.pow(2, this.retryConnection - 1), 16000) : 0;
+    private closeReconnectingProgress() {
+        this.reconnectingStatus?.dispose();
+        this.reconnectingStatus = undefined;
+    }
 
-        // Show reconnecting notification on first retry
-        if (this.retryConnection === 1 && !this.reconnectingNotification) {
-            this.reconnectingNotification = true;
-            vscode.window.withProgress({
-                location: vscode.ProgressLocation.Notification,
-                title: vscode.l10n.t('Reconnecting to {serverName}...', {serverName:this.serverName}),
-                cancellable: false,
-            }, async () => {
-                // Keep the notification visible while reconnecting
-                await new Promise<void>((resolve) => {
-                    const check = () => {
-                        if (this.root || this.retryConnection >= MAX_RETRIES) {
-                            this.reconnectingNotification = false;
-                            resolve();
-                        } else {
-                            setTimeout(check, 500);
-                        }
-                    };
-                    check();
-                });
-            });
-        }
+    async retryInitialization():Promise<ProjectEntity> {
+        if (this.disposed) { throw new Error('Cannot reconnect a disposed project'); }
+        if ((this.initializationActive || this.refreshTreePromise) && this.initializing) { return this.initializing; }
+        this.reconnectError=undefined; this.retryConnection=0; this.initializing=undefined;
+        this.socket.allowManualReconnect?.();
+        return this.init();
+    }
 
-        // Wait for backoff delay before retrying
-        const attemptReconnect = async (): Promise<ProjectEntity> => {
-            if (delayMs > 0) {
-                await new Promise(resolve => setTimeout(resolve, delayMs));
-            }
-
-            // Only recreate the socket when the connection scheme has changed
-            // (e.g., v1→v2 after connectionRejected). For transient disconnects,
-            // socket.io's built-in auto-reconnect handles re-establishing the TCP
-            // connection without creating a new one — avoiding TCP RST packets.
-            if (this.socket.needsReinit) {
-                this.socket.init();
-                this.handlersRegistered = false;
-            }
-
-            // Register event handlers once on the current socket
-            if (!this.handlersRegistered) {
-                this.remoteWatch();
-                this.handlersRegistered = true;
-            }
-
-            this.root = undefined;
-            return this.socket.joinProject(this.projectId).then(async (project) => {
-                // Reset retry counter on success
-                this.retryConnection = 0;
-                this.reconnectingNotification = false;
-                // fetch project settings
-                const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-                project.settings = (await this.api.getProjectSettings(identity, this.projectId)).settings!;
-                this.root = project;
-                const activeCondition = (vscode.workspace.workspaceFolders===undefined) || (vscode.workspace.workspaceFolders?.[0].uri.scheme!==ROOT_NAME) || (vscode.workspace.workspaceFolders?.[0].uri===this.origin);
-                // Register: [collaboration] ClientManager on Statusbar
-                if (activeCondition) {
-                    if (this.clientManagerItem?.triggers) {
-                        this.clientManagerItem.triggers.forEach((trigger) => trigger.dispose());
-                        delete this.clientManagerItem;
+    private get initializingPromise():Promise<ProjectEntity> {
+        this.initializationActive=true;
+        return this.initializeProject().finally(()=>{ this.initializationActive=false; });
+    }
+    private async waitForReconnect(delayMs:number):Promise<void> {
+        this.reconnectAbort??=new AbortController();
+        const signal=this.reconnectAbort.signal;
+        if (signal.aborted || this.disposed) { throw new Error('Reconnect cancelled'); }
+        if (!delayMs) { return; }
+        await new Promise<void>((resolve,reject)=>{
+            const cancel=()=>{ clearTimeout(timer); reject(new Error('Reconnect cancelled')); };
+            const timer=setTimeout(()=>{ signal.removeEventListener('abort',cancel); resolve(); },delayMs);
+            signal.addEventListener('abort',cancel,{once:true});
+        });
+    }
+    private async initializeProject():Promise<ProjectEntity> {
+        const maxAttempts=5;
+        let lastError:Error=new Error('Connection lost');
+        for (;this.retryConnection<maxAttempts;) {
+            const attempt=this.retryConnection;
+            await this.waitForReconnect(attempt?(3+Math.floor(Math.random()*7))*1000:0);
+            let newClient:ClientManager|undefined,newCollection:SCMCollectionProvider|undefined;
+            try {
+                if (attempt>0 || this.socket.needsReinit) { this.socket.init(); }
+                if (!this.handlersRegistered) { this.remoteWatch(); this.handlersRegistered=true; }
+                this.root=undefined;
+                const project=await this.socket.joinProject(this.projectId);
+                project.settings=await this.fetchProjectSettings();
+                if (this.disposed) { throw new Error('Project initialization was cancelled'); }
+                this.root=project; this.socket.completeProjectRefresh();
+                await this.otDocuments?.reconnect();
+                const activeCondition=!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders[0]?.uri.scheme!==ROOT_NAME || vscode.workspace.workspaceFolders[0]?.uri.toString()===this.origin.toString();
+                const firstInitialization=!this.runtimeInitialized;
+                if (activeCondition && firstInitialization) {
+                    const ownsUI=!VirtualFileSystem.runtimeUiOwner || VirtualFileSystem.runtimeUiOwner===this;
+                    if (ownsUI) {
+                        VirtualFileSystem.runtimeUiOwner=this;
+                        newClient=new ClientManager(this,this.context,this.publicId||'',this.socket);
+                        this.clientManagerItem={manager:newClient,triggers:newClient.triggers};
                     }
-                    const clientManager = new ClientManager(this, this.context, this.publicId||'', this.socket);
-                    this.clientManagerItem = {
-                        manager: clientManager,
-                        triggers: clientManager.triggers,
-                    };
+                    newCollection=new SCMCollectionProvider(this,this.context,ownsUI);
+                    await newCollection.ready;
+                    if (this.disposed) { throw new Error('Project initialization was cancelled'); }
+                    this.scmCollectionItem={collection:newCollection,triggers:newCollection.triggers};
                 }
-                // Register: [scm] SCMCollectionProvider in explorer
-                if (activeCondition) {
-                    if (this.scmCollectionItem?.triggers) {
-                        this.scmCollectionItem.triggers.forEach((trigger) => trigger.dispose());
-                        delete this.scmCollectionItem;
-                    }
-                    const scmCollection = new SCMCollectionProvider(this, this.context);
-                    this.scmCollectionItem = {
-                        collection: scmCollection,
-                        triggers: scmCollection.triggers,
-                    };
-                }
-                // trigger the first compile
-                vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
+                this.runtimeInitialized=true;
+                if (this.disconnectedTree) { this.publishReconnectTreeChanges(this.disconnectedTree,this.treeIndex(project)); this.disconnectedTree=undefined; }
+                this.retryConnection=0; this.reconnectError=undefined; this.closeReconnectingProgress();
+                if (firstInitialization) { void vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`,this.origin); }
                 return project;
-            }).catch((err) => {
-                this.retryConnection += 1;
-                return this.initializingPromise;
-            });
-        };
-
-        return attemptReconnect();
-    }
-
-    get isInvisibleMode() {
-        return this.socket.isUsingAlternativeConnectionScheme;
-    }
-
-    toggleInvisibleMode() {
-        // Clear disconnect debounce to prevent false retry trigger during mode switch
-        this.lastDisconnectTime = 0;
-        this.handlersRegistered = false; // Will re-register on the new socket scheme
-        if (this.retryTimer) {
-            clearTimeout(this.retryTimer);
-            this.retryTimer = undefined;
+            } catch (error:any) {
+                this.root=undefined;
+                newClient?.dispose(); newCollection?.dispose();
+                if (this.clientManagerItem?.manager===newClient) { this.clientManagerItem=undefined; }
+                if (this.scmCollectionItem?.collection===newCollection) { this.scmCollectionItem=undefined; }
+                if (!this.runtimeInitialized && VirtualFileSystem.runtimeUiOwner===this) { VirtualFileSystem.runtimeUiOwner=undefined; }
+                lastError=error instanceof Error?error:new Error(String(error));
+                this.socket.pause();
+                this.retryConnection++;
+                if (this.disposed) { this.closeReconnectingProgress(); throw lastError; }
+                const authFailure=[401,403].includes(error?.statusCode??error?.status) || /unauthori[sz]ed|not.?authorized|login required|not logged in|invalid credentials|forbidden/i.test(lastError.message);
+                const fatal=this.socket.isForcedDisconnected || authFailure || (error instanceof NetworkRequestError && ['auth-required','fatal-error','not-found'].includes(error.kind));
+                if (fatal) { break; }
+                if (!this.reconnectingStatus && this.retryConnection<maxAttempts) { this.reconnectingStatus=vscode.window.setStatusBarMessage(`$(sync~spin) Reconnecting to ${this.serverName}…`); }
+            }
         }
-        this.socket.toggleAlternativeConnectionScheme(this.origin.toString(), this.root);
-        this.socket.disconnect(); // jump to `onDisconnected` handler
+        this.closeReconnectingProgress(); this.reconnectError=lastError;
+        vscode.window.setStatusBarMessage(`$(error) Overleaf connection stopped. Run “Overleaf: Retry Connection”.`,10000);
+        throw lastError;
     }
 
     async _resolveUri(uri: vscode.Uri) {
@@ -328,7 +383,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             let currentFolder = root.rootFolder[0];
             for (let i = 0; i < pathParts.length-1; i++) {
                 const folderName = pathParts[i];
-                const folder = currentFolder.folders.find((folder) => folder.name === folderName);
+                const folders=currentFolder.folders.filter(folder=>folder.name===folderName);
+                if (folders.length>1) { throw new Error(`Ambiguous remote path: duplicate folder ${folderName}`); }
+                const folder = folders[0];
                 if (folder) {
                     currentFolder = folder;
                 } else {
@@ -340,14 +397,15 @@ export class VirtualFileSystem extends vscode.Disposable {
         })();
         // resolve file
         const [fileEntity, fileType, fileId] = (() => {
+            if (!fileName) { return [parentFolder,'folder' as FileType,parentFolder._id]; }
+            const matches:Array<{entity:FileEntity;type:FileType}>=[];
             for (const _type of Object.keys(FolderKeys)) {
-                let entity = parentFolder[ FolderKeys[_type] ]?.find((entity) => entity.name === fileName);
-                if (!fileName && _type==='folder') { entity = parentFolder; }
-                if (entity) {
-                    return [entity, _type as FileType, entity._id];
+                for (const entity of parentFolder[FolderKeys[_type]]?.filter(entity=>entity.name===fileName)??[]) {
+                    matches.push({entity,type:_type as FileType});
                 }
             }
-            return [];
+            if (matches.length>1) { throw new Error(`Ambiguous remote path: duplicate entity ${fileName}`); }
+            return matches.length ? [matches[0].entity,matches[0].type,matches[0].entity._id] : [];
         })();
         return {parentFolder, fileName, fileEntity, fileType, fileId};
     }
@@ -414,6 +472,34 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
+    private treeIndex(project?:ProjectEntity):Map<string,{path:string;signature:string}> {
+        const result=new Map<string,{path:string;signature:string}>();
+        const root=project?.rootFolder?.[0]; if (!root) { return result; }
+        const visit=(folder:FolderEntity,prefix:string)=>{
+            for (const doc of folder.docs??[]) {
+                result.set(doc._id,{path:prefix+doc.name,signature:`doc:${doc.version??-1}:${doc.lastVersion??-1}`});
+            }
+            for (const file of folder.fileRefs??[]) {
+                result.set(file._id,{path:prefix+file.name,signature:`file:${(file as any).created??''}:${(file as any).updatedAt??''}`});
+            }
+            for (const child of folder.folders??[]) { visit(child,`${prefix}${child.name}/`); }
+        };
+        visit(root,'/'); return result;
+    }
+
+    private publishReconnectTreeChanges(before:Map<string,{path:string;signature:string}>,after:Map<string,{path:string;signature:string}>):void {
+        const events:vscode.FileChangeEvent[]=[];
+        for (const [id,oldEntry] of before) {
+            const next=after.get(id);
+            if (!next) { events.push({type:vscode.FileChangeType.Deleted,uri:this.pathToUri(oldEntry.path)}); }
+            else if (next.path!==oldEntry.path) {
+                events.push({type:vscode.FileChangeType.Deleted,uri:this.pathToUri(oldEntry.path)},{type:vscode.FileChangeType.Created,uri:this.pathToUri(next.path)});
+            } else if (next.signature!==oldEntry.signature) { events.push({type:vscode.FileChangeType.Changed,uri:this.pathToUri(next.path)}); }
+        }
+        for (const [id,next] of after) { if (!before.has(id)) { events.push({type:vscode.FileChangeType.Created,uri:this.pathToUri(next.path)}); } }
+        if (events.length) { this.notify(events); }
+    }
+
     private removeEntity(parentFolder: FolderEntity, fileType:FileType, entity: FileEntity) {
         const key = FolderKeys[fileType];
         const index = parentFolder[key]?.findIndex((e) => e._id === entity._id);
@@ -429,6 +515,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         const key = FolderKeys[fileType];
         const index = parentFolder[key]?.findIndex((e) => e._id === entityId);
         if (index!==undefined && index>=0) {
+            const entity=parentFolder[key]?.[index];
+            if (entity) { this.removeMetadata(entity,fileType); }
             parentFolder[key]?.splice(index, 1);
             return true;
         } else {
@@ -436,36 +524,60 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
+    private removeMetadata(entity:FileEntity,type:FileType):void {
+        this.projectMetadata.remove(entity._id);
+        this.metadataTasks?.cancel(entity._id);
+        if (type==='folder') {
+            const folder=entity as FolderEntity;
+            for (const doc of folder.docs??[]) { this.removeMetadata(doc,'doc'); }
+            for (const child of folder.folders??[]) { this.removeMetadata(child,'folder'); }
+        }
+    }
+
     private remoteWatch(): void {
         this.socket.updateEventHandlers({
+            onOtError:docId=>{
+                this.otDocuments?.peek(docId)?.fail(new Error('The server rejected the document operation; local changes retained'));
+            },
             onDisconnected: () => {
+                this.otDocuments?.disconnect();
+                if (this.disposed) { return; }
                 if (this.root===undefined) { return; } // bypass the first initialization
                 console.log("Disconnected");
-                // Debounce: ignore rapid disconnect/reconnect cycles (within 2 seconds)
-                const now = Date.now();
-                if (now - this.lastDisconnectTime < 2000) {
-                    console.log("Disconnected: debounced (too soon since last disconnect)");
+                // Never expose the pre-disconnect project tree as a fresh snapshot.
+                this.metadataTasks?.dispose();
+                this.metadataCache?.reset();
+                this.disconnectedTree=this.treeIndex(this.root);
+                this.root=undefined;
+                this.initializing=undefined;
+                if (this.socket.isForcedDisconnected) {
+                    this.reconnectError=new Error('Server forced disconnection; run Overleaf: Retry Connection when available');
+                    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer=undefined; }
+                    this.closeReconnectingProgress();
+                    void vscode.window.showWarningMessage(
+                        'The Overleaf server requested a disconnect. Automatic reconnection is paused. After maintenance, run Overleaf: Retry Connection.',
+                        'Retry Connection',
+                    ).then(action=>{
+                        if (action==='Retry Connection' && !this.disposed) {
+                            void this.retryInitialization().catch(error=>vscode.window.showErrorMessage(`Unable to reconnect: ${error.message}`));
+                        }
+                    });
                     return;
                 }
-                this.lastDisconnectTime = now;
-                // Clear any pending retry timer
-                if (this.retryTimer) {
-                    clearTimeout(this.retryTimer);
-                }
-                // Delay reconnection attempt slightly to allow transient issues to resolve
+                if (this.retryTimer) { return; }
                 this.retryTimer = setTimeout(() => {
-                    this.retryConnection += 1;
-                    this.initializing = this.initializingPromise;
-                }, 1000);
+                    this.retryTimer = undefined;
+                    if (this.disposed || this.reconnectError) { return; }
+                    if (!this.initializing) {
+                        this.initializing = this.initializingPromise;
+                        void this.initializing.catch(error=>console.error(`${ROOT_NAME}: reconnect failed`,error));
+                    }
+                }, (3+Math.floor(Math.random()*7))*1000);
             },
             onConnectionAccepted: (publicId:string) => {
-                this.retryConnection = 0;
-                this.reconnectingNotification = false;
-                this.lastDisconnectTime = 0;
-                if (this.retryTimer) {
-                    clearTimeout(this.retryTimer);
-                    this.retryTimer = undefined;
-                }
+                if (this.disposed) { return; }
+                // Transport acceptance is not project readiness. The retry task must
+                // continue until joinProject succeeds.
                 this.publicId = publicId;
             },
             onFileCreated: (parentFolderId:string, type:FileType, entity:FileEntity) => {
@@ -491,10 +603,14 @@ export class VirtualFileSystem extends vscode.Disposable {
                     ]);
                 }
             },
+            onDocMetadata: data => { this.projectMetadata.update(data); },
             onFileRemoved: (entityId:string) => {
+                this.projectMetadata.remove(entityId);
+                this.metadataTasks?.cancel(entityId);
                 const res = this._resolveById(entityId);
                 if (res) {
                     const {parentFolder, fileType, fileEntity} = res;
+                    this.removeMetadata(fileEntity,fileType);
                     this.removeEntity(parentFolder, fileType, fileEntity);
                     this.notify([
                         {type: vscode.FileChangeType.Deleted, uri: this.pathToUri(res.path)}
@@ -515,36 +631,13 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
             },
             onFileChanged: (update:UpdateSchema) => {
+                if (this.otDocuments?.receive(update)) { return; }
                 const res = this._resolveById(update.doc);
                 if (res===undefined) { return; }
 
-                const doc = res.fileEntity as DocumentEntity;
-                if (update.v===doc.version) {
-                    doc.version += 1;
-                    if (update.op && doc.remoteCache!==undefined) {
-                        let content = doc.remoteCache;
-                        update.op.forEach((op) => {
-                            if (op.i) {
-                                content = content.slice(0, op.p) + op.i + content.slice(op.p);
-                            } else if (op.d) {
-                                const deleteUtf8 = Buffer.from(op.d, 'ascii').toString('utf-8');
-                                content = content.slice(0, op.p) + content.slice(op.p+deleteUtf8.length);
-                            }
-                        });
-                        const _uri = this.pathToUri(res.path).toString();
-                        const _doc = vscode.workspace.textDocuments.find((doc) => doc.uri.toString()===_uri);
-                        // if doc dirty, local cache should diverge from remote cache
-                        if (_doc && !_doc.isDirty) {doc.localCache = content;}
-                        doc.remoteCache = content;
-                        this.isDirty = true;
-                        this.notify([
-                            {type: vscode.FileChangeType.Changed, uri: this.pathToUri(res.path)}
-                        ]);
-                    }
-                } else {
-                    doc.remoteCache = undefined;
-                    doc.localCache = undefined;
-                }
+                // Only the OT session may advance a subscribed document's version.
+                // An unsolicited update for an unopened document invalidates its hint.
+                (res.fileEntity as DocumentEntity).remoteCache=undefined;
             },
             onSpellCheckLanguageUpdated: (language:string) => {
                 if (this.root) {
@@ -555,7 +648,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             onCompilerUpdated: (compiler:string) => {
                 if (this.root) {
                     this.root.compiler = compiler;
-                    EventBus.fire('compilerUpdateEvent', {compiler});
+                    EventBus.fire('compilerUpdateEvent', {compiler,uri:this.origin});
                 }
             },
             onRootDocUpdated: (rootDocId:string) => {
@@ -606,6 +699,84 @@ export class VirtualFileSystem extends vscode.Disposable {
         return results;
     }
 
+    async readEditorFile(uri:vscode.Uri):Promise<Uint8Array> {
+        const content=await this.openFile(uri);
+        const {fileType,fileEntity}=await this._resolveUri(uri);
+        if (fileType==='doc' && fileEntity) {
+            this.editorBases??=new Map();
+            const dirty=vscode.workspace.textDocuments.some(document=>document.uri.toString()===uri.toString()&&document.isDirty);
+            if (!dirty || !this.editorBases.has(fileEntity._id)) { this.editorBases.set(fileEntity._id,new TextDecoder('utf8',{fatal:true}).decode(content)); }
+        }
+        return content;
+    }
+
+    private get documents():OtDocuments {
+        if (!this.otDocuments) {
+            const identity=createHash('sha256').update(`${this.serverName}\0${this.projectId}\0${this.userId}`).digest('hex');
+            const root=vscode.Uri.joinPath(this.context.globalStorageUri,'ot',identity);
+            const store=new SyncStateStore(root.fsPath,{projectId:this.projectId,serverIdentityHash:identity});
+            this.otOutput=vscode.window.createOutputChannel('Overleaf OT');
+            this.otDocuments=new OtDocuments(store,{
+                join:async(id,version)=>{
+                    await vscode.workspace.fs.createDirectory(root);
+                    return this.socket.joinDoc(id,version);
+                },source:()=>this.publicId,
+                send:update=>this.socket.applyOtUpdate(update.doc,update as UpdateSchema),
+                log:(id,stage,elapsed)=>this.otOutput?.appendLine(`${new Date().toISOString()} doc=${id} ${stage} ${elapsed}ms`),
+                error:(id,error)=>{ this.otOutput?.appendLine(`doc=${id} paused: ${error.message}`); void vscode.window.showWarningMessage(`Overleaf synchronization paused: ${error.message}`); },
+                changed:(id,session,remote,op)=>{
+                    const found=this._resolveById(id);
+                    if (!found) { return; }
+                    const doc=found.fileEntity as DocumentEntity;
+                    const savedChanged=doc.localCache!==session.saved;
+                    const confirmedChanged=doc.remoteCache!==session.confirmed;
+                    if (confirmedChanged) {
+                        this.isDirty=true;
+                        if (!remote && doc.remoteCache!==undefined) { this.scheduleMetadataRefresh(id); }
+                    }
+                    doc.version=session.version; doc.remoteCache=session.confirmed; doc.localCache=session.saved;
+                    const uri=this.pathToUri(found.path);
+                    const editor=vscode.workspace.textDocuments.find(item=>item.uri.toString()===uri.toString());
+                    if (editor) { this.bindOtEditor(editor,session); }
+                    for (const binding of [...this.otEditors.values()]) {
+                        if (binding.session.id===id && binding.session!==session && !binding.document.isClosed) { this.bindOtEditor(binding.document,session); }
+                    }
+                    for (const binding of this.otEditors.values()) {
+                        if (binding.session===session) { void binding.refresh().catch(()=>undefined); }
+                    }
+                    if (savedChanged) { this.notify([{type:vscode.FileChangeType.Changed,uri}]); }
+                    this.otListeners.forEach(listener=>listener(id,op));
+                },
+            },vscode.workspace.fs.createDirectory(root));
+        }
+        return this.otDocuments;
+    }
+    bindOtEditor(document:vscode.TextDocument,session:OtSession):void {
+        const key=document.uri.toString();
+        if (this.otEditors.get(key)?.session!==session) { this.otEditors.get(key)?.dispose(); this.otEditors.delete(key); }
+        if (!this.otEditors.has(key)) {
+            this.otEditors.set(key,new OtEditor(document,session,error=>{
+                this.otOutput?.appendLine(`editor paused: ${error.message}`);
+                void vscode.window.showWarningMessage(`Overleaf editor synchronization paused: ${error.message}`);
+            },vscode));
+        }
+    }
+    onOtChange(listener:(id:string,op?:TextOperation)=>void):vscode.Disposable { this.otListeners.add(listener); return new vscode.Disposable(()=>this.otListeners.delete(listener)); }
+    async textSession(uri:vscode.Uri):Promise<OtSession|undefined> {
+        const {fileType,fileEntity}=await this._resolveUri(uri);
+        return fileType==='doc' && fileEntity ? this.documents.get(fileEntity._id) : undefined;
+    }
+    async confirmedTextSnapshot(uri:vscode.Uri):Promise<RemoteSnapshot|undefined> {
+        const session=await this.textSession(uri);
+        if (!session) { return; }
+        const {fileEntity}=await this._resolveUri(uri);
+        const content=Buffer.from(session.confirmed),hash=contentHash(content)!;
+        return {path:uri.path,entityId:fileEntity!._id,kind:'text',content,hash,
+            revision:{kind:'document',documentVersion:session.version,contentHash:hash},connectionEpoch:this.socket.connectionEpoch};
+    }
+    async waitForSavedText():Promise<void> { await this.otDocuments?.barrier(); }
+    logSyncStage(stage:string,elapsed:number):void { this.otOutput?.appendLine(`${new Date().toISOString()} ${stage} ${elapsed}ms`); }
+
     async openFile(uri: vscode.Uri): Promise<Uint8Array> {
         const {fileType, fileEntity} = await this._resolveUri(uri);
         if (!fileEntity) {
@@ -613,20 +784,9 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
 
         if (fileType==='doc') {
-            const doc = fileEntity as DocumentEntity;
-            if (doc.remoteCache!==undefined) {
-                const content = doc.remoteCache;
-                EventBus.fire('fileWillOpenEvent', {uri});
-                return new TextEncoder().encode(content);
-            } else {
-                const res = await this.socket.joinDoc(fileEntity._id);
-                const content = res.docLines.join('\n');
-                doc.version = res.version;
-                doc.remoteCache = content;
-                doc.localCache  = content;
-                EventBus.fire('fileWillOpenEvent', {uri});
-                return new TextEncoder().encode(content);
-            }
+            const session=await this.documents.get(fileEntity._id);
+            EventBus.fire('fileWillOpenEvent',{uri});
+            return Buffer.from(session.saved);
         } else if (fileType==='outputs') {
             const {compileGroup, clsiServerId, pdfDownloadDomain} = this;
             return GlobalStateManager.authenticate(this.context, this.serverName)
@@ -636,9 +796,8 @@ export class VirtualFileSystem extends vscode.Disposable {
                     if (res.type==='success') {
                         EventBus.fire('fileWillOpenEvent', {uri});
                         return res.content;
-                    } else {
-                        return new Uint8Array(0);
                     }
+                    throw new Error(res.message??'Failed to download compile output');
                 });
             });
         } else {
@@ -648,13 +807,253 @@ export class VirtualFileSystem extends vscode.Disposable {
             if (res.type==='success' && res.content) {
                 EventBus.fire('fileWillOpenEvent', {uri});
                 return res.content;
-            } else {
-                return new Uint8Array(0);
             }
+            throw new NetworkRequestError(res.errorKind??'fatal-error',res.message??'Failed to download remote file',res.statusCode);
         }
     }
 
-    async createFile(uri: vscode.Uri, content:Uint8Array, overwrite?:boolean) {
+    async describePdf(uri:vscode.Uri):Promise<import('../api/pdfByteSource').PdfSourceDescriptor> {
+        const {fileType,fileEntity}=await this._resolveUri(uri);
+        if (!fileEntity) { throw vscode.FileSystemError.FileNotFound(uri); }
+        const identity=await GlobalStateManager.authenticate(this.context,this.serverName);
+        if (fileType==='outputs') {
+            return this.api.describePdf(identity,(fileEntity as OutputFileEntity).url,this.outputBuildId??randomUUID(),this.compileGroup,this.clsiServerId,this.pdfDownloadDomain);
+        }
+        if (fileType==='file') { return this.api.describePdf(identity,`project/${this.projectId}/file/${fileEntity._id}`,randomUUID()); }
+        throw vscode.FileSystemError.Unavailable('Only PDF files support byte-range preview');
+    }
+
+    /** Reads a versioned snapshot for the safe local-replica synchronizer. */
+    async readRemoteSnapshot(uri:vscode.Uri, force=false,retainSubscription=false):Promise<RemoteSnapshot|undefined> {
+        const key=`${uri.toString()}\0${force}\0${retainSubscription}`;
+        const inFlight=this.snapshotReads.get(key); if (inFlight) { return inFlight; }
+        const task=this.readRemoteSnapshotImpl(uri,force,retainSubscription).finally(()=>this.snapshotReads.delete(key));
+        this.snapshotReads.set(key,task); return task;
+    }
+
+    private async readRemoteSnapshotImpl(uri:vscode.Uri, force:boolean,retainSubscription:boolean):Promise<RemoteSnapshot|undefined> {
+        let snapshotEpoch:number|undefined;
+        try {
+            await this.init();
+            snapshotEpoch=this.socket.connectionEpoch;
+            if (!this.socket.isReady) { throw new NetworkRequestError('offline','The Overleaf project connection is not ready'); }
+            const {fileType,fileEntity}=await this._resolveUri(uri);
+            if (!fileEntity || fileType==='folder' || fileType==='outputs') {
+                if (this.socket.connectionEpoch!==snapshotEpoch || !this.socket.isReady) {
+                    throw new NetworkRequestError('transient-error','The project connection changed while verifying remote absence');
+                }
+                return undefined;
+            }
+            let content:Uint8Array;
+            if (fileType==='doc') {
+                const session=await this.documents.get(fileEntity._id);
+                content=Buffer.from(session.confirmed);
+                (fileEntity as DocumentEntity).version=session.version;
+            } else {
+                content=await this.openFile(uri);
+            }
+            if (this.socket.connectionEpoch!==snapshotEpoch || !this.socket.isReady) {
+                throw new NetworkRequestError('transient-error','The project connection changed while reading a remote snapshot');
+            }
+            const hash=contentHash(content)!;
+            const revision:RemoteRevision=fileType==='doc'
+                ? {kind:'document',documentVersion:(fileEntity as DocumentEntity).version??-1,contentHash:hash}
+                : {kind:'file',entityId:fileEntity._id,contentHash:hash};
+            return {path:uri.path,entityId:fileEntity._id,kind:fileType==='doc'?'text':'binary',content,hash,revision,connectionEpoch:snapshotEpoch};
+        } catch (error:any) {
+            if (error instanceof vscode.FileSystemError && error.code==='FileNotFound') {
+                if (snapshotEpoch===this.socket.connectionEpoch && this.socket.isReady) { return undefined; }
+                throw new NetworkRequestError('transient-error','The project connection changed while resolving a remote file');
+            }
+            throw error;
+        }
+    }
+
+    private isRemoteDocumentOpen(uri:vscode.Uri):boolean {
+        return vscode.workspace.textDocuments.some(document=>document.uri.toString()===uri.toString());
+    }
+
+    async applyDocumentSnapshot(uri:vscode.Uri,expected:RemoteRevision|undefined,content:Uint8Array):Promise<ApplyResult> {
+        return this.applyVerifiedDocumentSnapshot(uri,expected,content);
+    }
+
+    async applyFileSnapshot(uri:vscode.Uri,expected:RemoteRevision|undefined,content:Uint8Array,operationId:string=randomUUID()):Promise<ApplyResult> {
+        const operationEpoch=this.socket.connectionEpoch;
+        const slash=uri.path.lastIndexOf('/'),name=uri.path.slice(slash+1);
+        const temporaryPath=`${uri.path.slice(0,slash+1)}.overleaf-sync-${operationId}-${name}`;
+        const temporaryUri=uri.with({path:temporaryPath});
+        try {
+            const [before,existingTemporary]=await Promise.all([this.readRemoteSnapshot(uri,true),this.readRemoteSnapshot(temporaryUri,true)]);
+            if (expected && (!before || before.hash!==expected.contentHash || before.entityId!==(expected.kind==='file'?expected.entityId:before.entityId))) {
+                return {type:'conflict',snapshot:before,message:'Remote binary revision changed before staging'};
+            }
+            if (existingTemporary && existingTemporary.hash!==contentHash(content)) {
+                return {type:'conflict',snapshot:existingTemporary,message:`A different staged upload already exists at ${temporaryPath}`,temporaryPath,temporaryEntityId:existingTemporary.entityId};
+            }
+            if (!existingTemporary) {
+                try { await this.createUploadedFile(temporaryUri,content); }
+                catch (error:any) {
+                    if (!(error instanceof NetworkRequestError) || !['offline','transient-error','unknown-outcome'].includes(error.kind)) { throw error; }
+                    await this.refreshProjectTree();
+                    const uncertainStage=await this.readRemoteSnapshot(temporaryUri,true);
+                    return {
+                        type:'unknown',
+                        message:uncertainStage?.hash===contentHash(content)
+                            ? 'The staged upload exists, but its original response was lost; replacement was paused for recovery'
+                            : 'The staged upload result is unknown; replacement was paused without deleting the original',
+                        temporaryPath,
+                        temporaryEntityId:uncertainStage?.entityId,
+                    };
+                }
+            }
+            const staged=await this.readRemoteSnapshot(temporaryUri,true);
+            if (!staged || staged.hash!==contentHash(content)) {
+                return {type:'unknown',message:'Staged binary upload could not be verified',temporaryPath,temporaryEntityId:staged?.entityId};
+            }
+            if (this.socket.connectionEpoch!==operationEpoch || staged.connectionEpoch!==operationEpoch
+                || (before && before.connectionEpoch!==operationEpoch)) {
+                return {type:'unknown',snapshot:before,message:'Connection changed before the staged binary could replace the original',temporaryPath,temporaryEntityId:staged.entityId};
+            }
+            if (before) {
+                await this.remove(uri,false);
+                if (await this.readRemoteSnapshot(uri,true)) {
+                    return {type:'unknown',message:'Original binary deletion could not be verified',temporaryPath,temporaryEntityId:staged.entityId};
+                }
+            }
+            await this.rename(temporaryUri,uri,false);
+            const after=await this.readRemoteSnapshot(uri,true);
+            if (this.socket.connectionEpoch!==operationEpoch) {
+                return {type:'unknown',snapshot:after,message:'Binary upload verification crossed a connection boundary',temporaryPath,temporaryEntityId:staged.entityId};
+            }
+            if (after?.entityId===staged.entityId && after.hash===contentHash(content)) {
+                if (before?.hash!==after.hash) { this.isDirty=true; }
+                return {type:'verified',snapshot:after,temporaryPath,temporaryEntityId:staged.entityId};
+            }
+            return {type:'unknown',snapshot:after,message:'Staged binary rename could not be verified',temporaryPath,temporaryEntityId:staged.entityId};
+        } catch (error:any) {
+            return {type:'unknown',message:error?.message??String(error),temporaryPath};
+        }
+    }
+
+    async recoverStagedFileSnapshot(entry:JournalEntry,remoteBefore?:Uint8Array):Promise<ApplyResult> {
+        if (!entry.temporaryPath || !entry.targetHash) { return {type:'failed',message:'Journal has no staged binary identity'}; }
+        const targetUri=this.pathToUri('/'+entry.path);
+        const temporaryUri=this.pathToUri('/'+entry.temporaryPath.replace(/^\//,''));
+        try {
+            let target:RemoteSnapshot|undefined,temporary:RemoteSnapshot|undefined;
+            try { [target,temporary]=await Promise.all([this.readRemoteSnapshot(targetUri,true),this.readRemoteSnapshot(temporaryUri,true)]); }
+            catch {
+                // A mutation whose response was lost can leave the in-memory tree stale.
+                // Refresh once before deciding whether either entity exists; never infer
+                // deletion from the stale cache.
+                await this.refreshProjectTree();
+                [target,temporary]=await Promise.all([this.readRemoteSnapshot(targetUri,true),this.readRemoteSnapshot(temporaryUri,true)]);
+            }
+            const recoveryEpoch=this.socket.connectionEpoch;
+            if ((target && target.connectionEpoch!==recoveryEpoch) || (temporary && temporary.connectionEpoch!==recoveryEpoch)) {
+                return {type:'unknown',snapshot:target,message:'Connection changed while reading staged binary recovery state',temporaryPath:entry.temporaryPath,temporaryEntityId:temporary?.entityId};
+            }
+            if (target?.hash===entry.targetHash) {
+                if (temporary?.hash===entry.targetHash) {
+                    await this.remove(temporaryUri,false);
+                    temporary=await this.readRemoteSnapshot(temporaryUri,true);
+                    if (temporary) { return {type:'unknown',snapshot:target,message:'Committed target is safe, but duplicate staged entity remains',temporaryPath:entry.temporaryPath,temporaryEntityId:temporary.entityId}; }
+                }
+                return {type:'verified',snapshot:target};
+            }
+            const originalHash=remoteBefore&&contentHash(remoteBefore);
+            if (temporary?.hash===entry.targetHash && (!target || (target.entityId===entry.originalEntityId && target.hash===originalHash))) {
+                if (target) {
+                    await this.remove(targetUri,false);
+                    if (this.socket.connectionEpoch!==recoveryEpoch) { return {type:'unknown',message:'Connection changed while deleting the original binary',temporaryPath:entry.temporaryPath,temporaryEntityId:temporary.entityId}; }
+                    if (await this.readRemoteSnapshot(targetUri,true)) { return {type:'unknown',message:'Original entity deletion remains unverified',temporaryPath:entry.temporaryPath,temporaryEntityId:temporary.entityId}; }
+                }
+                await this.rename(temporaryUri,targetUri,false);
+                const after=await this.readRemoteSnapshot(targetUri,true);
+                return this.socket.connectionEpoch===recoveryEpoch && after?.connectionEpoch===recoveryEpoch
+                    && after.entityId===temporary.entityId && after.hash===entry.targetHash
+                    ? {type:'verified',snapshot:after}
+                    : {type:'unknown',snapshot:after,message:'Staged rename remains unverified',temporaryPath:entry.temporaryPath,temporaryEntityId:temporary.entityId};
+            }
+            if (!target && !temporary && remoteBefore) {
+                await this.createUploadedFile(targetUri,remoteBefore);
+                target=await this.readRemoteSnapshot(targetUri,true);
+                return target?.hash===originalHash
+                    ? {type:'failed',snapshot:target,message:'Both remote entities were absent; the saved original was restored'}
+                    : {type:'unknown',snapshot:target,message:'Could not verify restoration of the saved remote original'};
+            }
+            if (target && !temporary && remoteBefore && target.hash===originalHash && target.entityId===entry.originalEntityId) {
+                return {type:'failed',snapshot:target,message:'The interrupted replacement was verified as not applied'};
+            }
+            return {type:'conflict',snapshot:target,message:'Staged binary recovery found an ambiguous remote state',temporaryPath:entry.temporaryPath,temporaryEntityId:temporary?.entityId};
+        } catch (error:any) {
+            return {type:'unknown',message:error?.message??String(error),temporaryPath:entry.temporaryPath,temporaryEntityId:entry.temporaryEntityId};
+        }
+    }
+
+    private async applyVerifiedDocumentSnapshot(uri:vscode.Uri,expected:RemoteRevision|undefined,content:Uint8Array):Promise<ApplyResult> {
+        try {
+            let session=await this.textSession(uri);
+            if (!session) {
+                if (expected) { return {type:'conflict',message:'Remote document disappeared'}; }
+                await this.createFile(uri,new Uint8Array(),false);
+                session=await this.textSession(uri);
+            }
+            if (!session) { return {type:'failed',message:'Could not initialize document OT'}; }
+            const before=await this.confirmedTextSnapshot(uri);
+            if (expected && (!before || !sameRemoteRevision(before.revision,expected))) {
+                return {type:'conflict',snapshot:before,message:'Recovery baseline changed'};
+            }
+            await session.save(new TextDecoder('utf8',{fatal:true}).decode(content));
+            if (before?.hash!==contentHash(Buffer.from(session.confirmed))) { this.isDirty=true; }
+            return {type:'verified',snapshot:await this.confirmedTextSnapshot(uri)};
+        } catch (error:any) { return {type:'unknown',message:error?.message??String(error)}; }
+    }
+
+    async deleteRemoteSnapshot(uri:vscode.Uri,expected?:RemoteRevision):Promise<ApplyResult> {
+        const operationEpoch=this.socket.connectionEpoch;
+        try {
+            const before=await this.readRemoteSnapshot(uri,true);
+            if (this.socket.connectionEpoch!==operationEpoch || (before && before.connectionEpoch!==operationEpoch)) {
+                return {type:'unknown',snapshot:before,message:'Connection changed before remote delete'};
+            }
+            if (!before) { return expected
+                ? {type:'conflict',message:'The expected remote entity is no longer present'}
+                : {type:'verified',connectionEpoch:operationEpoch}; }
+            if (!expected || !sameRemoteRevision(before.revision,expected)) { return {type:'conflict',snapshot:before,message:'Remote revision changed before delete'}; }
+            await this.remove(uri,true);
+            const after=await this.readRemoteSnapshot(uri,true);
+            if (this.socket.connectionEpoch!==operationEpoch) { return {type:'unknown',snapshot:after,message:'Remote delete verification crossed a connection boundary'}; }
+            if (after) { return {type:'unknown',snapshot:after,message:'Remote delete could not be verified'}; }
+            this.isDirty=true;
+            return {type:'verified',connectionEpoch:operationEpoch};
+        } catch (error:any) { return {type:'unknown',message:error?.message??String(error)}; }
+    }
+
+    async renameRemoteSnapshot(oldUri:vscode.Uri,newUri:vscode.Uri,expected?:RemoteRevision):Promise<ApplyResult> {
+        const operationEpoch=this.socket.connectionEpoch;
+        try {
+            const [before,target]=await Promise.all([this.readRemoteSnapshot(oldUri,true),this.readRemoteSnapshot(newUri,true)]);
+            if (this.socket.connectionEpoch!==operationEpoch || before?.connectionEpoch!==operationEpoch || (target && target.connectionEpoch!==operationEpoch)) {
+                return {type:'unknown',snapshot:before,message:'Connection changed before remote rename'};
+            }
+            if (!before) { return {type:'conflict',message:'Remote rename source no longer exists'}; }
+            if (target) { return {type:'conflict',snapshot:target,message:'Remote rename target already exists'}; }
+            if (expected && !sameRemoteRevision(before.revision,expected)) {
+                return {type:'conflict',snapshot:before,message:'Remote source changed before rename'};
+            }
+            await this.rename(oldUri,newUri,false);
+            const after=await this.readRemoteSnapshot(newUri,true);
+            if (this.socket.connectionEpoch===operationEpoch && after?.connectionEpoch===operationEpoch
+                && after.entityId===before.entityId && after.hash===before.hash) {
+                this.isDirty=true;
+                return {type:'verified',snapshot:after};
+            }
+            return {type:'unknown',snapshot:after,message:'Remote rename could not be verified'};
+        } catch (error:any) { return {type:'unknown',message:error?.message??String(error)}; }
+    }
+
+    async createFile(uri: vscode.Uri, content:Uint8Array, overwrite?:boolean):Promise<FileEntity> {
         const {parentFolder, fileName, fileEntity} = await this._resolveUri(uri);
         if (fileEntity && !overwrite) {
             throw vscode.FileSystemError.FileExists(uri);
@@ -667,30 +1066,47 @@ export class VirtualFileSystem extends vscode.Disposable {
             const _res = await this.api.addDoc(identity, this.projectId, parentFolder._id, fileName);
             if (_res.type==='success') {
                 res = _res.entity;
-            }
+            } else { throw new NetworkRequestError(_res.errorKind??'fatal-error',_res.message??'Remote document creation failed',_res.statusCode); }
         } else {
             const parentFolderId = parentFolder._id;
             const _res = await this.api.uploadFile(identity, this.projectId, parentFolderId, fileName, content);
             if (_res.type==='success' && _res.entity!==undefined) {
                 res = _res.entity;
             } else {
-                if (_res.message!==undefined) {
-                    vscode.window.showErrorMessage(_res.message);
-                }
+                throw new NetworkRequestError(_res.errorKind??'fatal-error',_res.message??'Remote upload failed',_res.statusCode);
             }
         }
         if (res && res._type) {
             this.insertEntity(parentFolder, res._type, res);
+            if (res._type==='doc' && content.length) { this.scheduleMetadataRefresh(res._id,250); }
             this.notify([
                 {type: vscode.FileChangeType.Created, uri: uri},
             ]);
+            return res;
         }
+        throw new NetworkRequestError(res?'fatal-error':'unknown-outcome','Remote create returned no entity');
+    }
+
+    private async createUploadedFile(uri:vscode.Uri,content:Uint8Array):Promise<FileEntity> {
+        const {parentFolder,fileName,fileEntity}=await this._resolveUri(uri);
+        if (fileEntity) { throw vscode.FileSystemError.FileExists(uri); }
+        const identity=await GlobalStateManager.authenticate(this.context,this.serverName);
+        const result=await this.api.uploadFile(identity,this.projectId,parentFolder._id,fileName,content);
+        if (result.type!=='success' || !result.entity || result.entity._type!=='file') {
+            throw new NetworkRequestError(result.errorKind??'fatal-error',result.message??'Binary upload did not create a file entity',result.statusCode);
+        }
+        this.insertEntity(parentFolder,'file',result.entity);
+        this.notify([{type:vscode.FileChangeType.Created,uri}]);
+        return result.entity;
     }
 
     async refreshLinkedFile(uri: vscode.Uri) {
         const {fileType, fileEntity} = await this._resolveUri(uri);
         if (fileType==='file' && fileEntity) {
-            if ((fileEntity as FileRefEntity).linkedFileData===null) { return; }
+            if ((fileEntity as FileRefEntity).linkedFileData===null) {
+                void vscode.window.showInformationMessage(vscode.l10n.t('This is not an external linked file.'));
+                return;
+            }
 
             vscode.window.withProgress({
                 location: vscode.ProgressLocation.Notification,
@@ -819,76 +1235,34 @@ export class VirtualFileSystem extends vscode.Disposable {
         ]);
     }
 
-    async writeFile(uri: vscode.Uri, content:Uint8Array, create:boolean, overwrite:boolean) {
-        const {fileType, fileEntity} = await this._resolveUri(uri);
+    async writeFile(uri:vscode.Uri,content:Uint8Array,create:boolean,overwrite:boolean):Promise<void> {
+        this.editorWrites??=new Map();
+        const key=uri.toString(),bytes=content.slice();
+        const task=(this.editorWrites.get(key)??Promise.resolve()).catch(()=>undefined).then(()=>this.writeEditorFile(uri,bytes,create,overwrite));
+        this.editorWrites.set(key,task);
+        try { await task; } finally { if (this.editorWrites.get(key)===task) { this.editorWrites.delete(key); } }
+    }
 
-        // if non-exists --> create it
-        if (!fileType && create) {
-            return this.createFile(uri, content, true);
+    private async writeEditorFile(uri:vscode.Uri,content:Uint8Array,create:boolean,overwrite:boolean):Promise<void> {
+        const {fileType,fileEntity}=await this._resolveUri(uri);
+        if (!fileType) {
+            if (!create) { throw vscode.FileSystemError.FileNotFound(uri); }
+            await this.createFile(uri,content,false); return;
         }
-
-        // if exists but not doc --> create new
-        if (fileType && fileType!=='doc' && create) {
-            return this.createFile(uri, content, overwrite);
-        }
-
-        // if exists and is doc --> update
-        if (fileType && fileType==='doc' && fileEntity) {
-            const doc = fileEntity as DocumentEntity;
-            const _content = new TextDecoder().decode(content);
-            if (doc.version===undefined || doc.localCache===undefined || doc.remoteCache===undefined) {
-                return;
-            }
-            const dmp = new DiffMatchPatch();
-            const patches = dmp.patch_make(doc.localCache,  doc.remoteCache);
-
-            const mergeResArray = dmp.patch_apply(patches, _content);
-            const mergeRes = mergeResArray[0] as string;
-            const update = {
-                doc: doc._id,
-                lastV: doc.lastVersion,
-                v: doc.version,
-                // Reference: services/web/frontend/js/vendor/libs/sharejs.js#L1288
-                hash: (()=>{
-                    if (!doc.mtime || Date.now()-doc.mtime>5000) {
-                        doc.mtime = Date.now();
-                        return require('crypto').createHash('sha1').update(
-                            "blob " + mergeRes.length + "\x00" + mergeRes
-                        ).digest('hex');
-                    }
-                })() as string,
-                op: (()=>{
-                    const remoteCacheAscii = Buffer.from(doc.remoteCache, 'utf-8').toString('utf-8');
-                    const mergeResAscii = Buffer.from(mergeRes, 'utf-8').toString('utf-8');
-                    let currentPos = 0;
-                    return dmp.diff_main(remoteCacheAscii, mergeResAscii)
-                                .map((part) => {
-                                    // part[0] === -1: delete, 0: equal, 1: insert; part[1]: compared content
-                                    const incCount = part[0] === -1 ? 0 : part[1].length;
-                                    currentPos += incCount;
-                                    // add op when content not equal
-                                    if (part[0] !== 0) {
-                                        return {
-                                            p: currentPos - incCount,
-                                            i: part[0] ===  1 ?  part[1] : undefined,
-                                            d: part[0] === -1 ?  part[1] : undefined,
-                                        };
-                                    }
-                                })
-                                .filter(x => x) as any;
-                })(),
-            };
-            this.isDirty = (update.op && update.op.length) ? true : false;
-            await this.socket.applyOtUpdate(doc._id, update);
-            doc.localCache = mergeRes;
-            doc.remoteCache = mergeRes;
-            setTimeout(() => {
-                this.notify([
-                    {type: vscode.FileChangeType.Changed, uri: uri}
-                ]);
-            }, 10);
-            doc.lastVersion = doc.version;                
-        }
+        if (!overwrite) { throw vscode.FileSystemError.FileExists(uri); }
+        if (fileEntity?.readonly || fileType==='outputs') { throw vscode.FileSystemError.NoPermissions(uri); }
+        if (fileType==='folder') { throw vscode.FileSystemError.FileIsADirectory(uri); }
+        if (fileType!=='doc' || !fileEntity) { await this.createFile(uri,content,true); return; }
+        if (!this.documents.peek(fileEntity._id)) { throw vscode.FileSystemError.Unavailable('The editing baseline is unavailable; open the document before saving'); }
+        const session=await this.documents.get(fileEntity._id);
+        const document=vscode.workspace.textDocuments.find(item=>item.uri.toString()===uri.toString());
+        if (document) { this.bindOtEditor(document,session); }
+        const target=new TextDecoder('utf8',{fatal:true}).decode(content);
+        const binding=this.otEditors.get(uri.toString());
+        if (binding) { await binding.save(target); } else { await session.save(target); }
+        this.scheduleMetadataRefresh(fileEntity._id);
+        this.isDirty=true;
+        this.notify([{type:vscode.FileChangeType.Changed,uri}]);
     }
 
     async mkdir(uri: vscode.Uri) {
@@ -902,11 +1276,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.notify([
                 {type: vscode.FileChangeType.Created, uri: uri},
             ]);
-        } else {
-            if (res.message!==undefined) {
-                vscode.window.showErrorMessage(res.message);
-            }
-        }
+        } else { throw new NetworkRequestError(res.errorKind??'fatal-error',res.message??'Remote folder creation failed',res.statusCode); }
     }
 
     async remove(uri: vscode.Uri, recursive: boolean) {
@@ -919,68 +1289,76 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.notify([
                     {type: vscode.FileChangeType.Deleted, uri: uri},
                 ]);
-            } else {
-                if (res.message!==undefined) {
-                    vscode.window.showErrorMessage(res.message);
-                }
-            }
+            } else { throw new NetworkRequestError(res.errorKind??'fatal-error',res.message??'Remote delete failed',res.statusCode); }
         }
     }
 
-    async rename(oldUri: vscode.Uri, newUri: vscode.Uri, force: boolean) {
-        const oldPath = await this._resolveUri(oldUri);
-        const newPath = await this._resolveUri(newUri);
-
-        if (oldPath.fileType && oldPath.fileEntity && oldPath.fileEntity) {
-            // delete existence firstly
-            if (newPath.fileType && newPath.fileEntity) {
-                if (!force) { return; }
-                await this.remove(newUri, true);
-                this.removeEntity(newPath.parentFolder, newPath.fileType, newPath.fileEntity);
+    async rename(oldUri:vscode.Uri,newUri:vscode.Uri,force:boolean):Promise<void> {
+        const task=(this.remoteTreeWrites??Promise.resolve()).catch(()=>undefined).then(()=>this.renameImpl(oldUri,newUri,force));
+        this.remoteTreeWrites=task.catch(()=>undefined); await task;
+    }
+    private async renameImpl(oldUri:vscode.Uri,newUri:vscode.Uri,force:boolean):Promise<void> {
+        const from=parseUri(oldUri),to=parseUri(newUri);
+        if (from.serverName!==to.serverName || from.userId!==to.userId || from.projectId!==to.projectId) { throw vscode.FileSystemError.NoPermissions('A move must stay within the same Overleaf project'); }
+        const oldPath=await this._resolveUri(oldUri),newPath=await this._resolveUri(newUri);
+        if (!oldPath.fileType || !oldPath.fileEntity) { throw vscode.FileSystemError.FileNotFound(oldUri); }
+        const entity=oldPath.fileEntity,type=oldPath.fileType;
+        if (entity.readonly || type==='outputs' || newPath.parentFolder.readonly || newPath.fileEntity?.readonly) { throw vscode.FileSystemError.NoPermissions(oldUri); }
+        if (type==='folder' && newUri.path.startsWith(oldUri.path+'/')) { throw vscode.FileSystemError.NoPermissions('A folder cannot be moved into itself'); }
+        if (newPath.fileEntity?._id===entity._id) { return; }
+        if (newPath.fileType && !force) { throw vscode.FileSystemError.FileExists(newUri); }
+        const identity=await GlobalStateManager.authenticate(this.context,this.serverName);
+        const requireSuccess=(response:any)=>{ if (response?.type!=='success') { throw new NetworkRequestError(response?.errorKind??'unknown-outcome',response?.message??'Remote move or rename was not confirmed',response?.statusCode); } };
+        let currentParent=oldPath.parentFolder,backupUri:vscode.Uri|undefined;
+        try {
+            if (newPath.fileEntity) {
+                if (newPath.fileType==='folder') { throw vscode.FileSystemError.NoPermissions('Overwriting a remote directory is not supported'); }
+                const before=await this.readRemoteSnapshot(newUri,true);
+                if (!before || !this.context.globalStorageUri) { throw vscode.FileSystemError.Unavailable('The replacement target could not be backed up'); }
+                const directory=vscode.Uri.joinPath(this.context.globalStorageUri,'remote-replacement-backups',randomUUID());
+                backupUri=vscode.Uri.joinPath(directory,'content');
+                await vscode.workspace.fs.createDirectory(directory);
+                await vscode.workspace.fs.writeFile(backupUri,before.content);
+                await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(directory,'metadata.json'),Buffer.from(JSON.stringify({uri:newUri.toString(),fileName:newPath.fileName,entityId:before.entityId,hash:before.hash,createdAt:Date.now()})));
+                if (contentHash(await vscode.workspace.fs.readFile(backupUri))!==before.hash) { throw new Error('Replacement backup verification failed'); }
+                const latest=await this.readRemoteSnapshot(newUri,true);
+                if (!latest || latest.entityId!==before.entityId || !sameRemoteRevision(latest.revision,before.revision)) { throw new Error('The replacement target changed while being backed up'); }
+                await this.remove(newUri,false);
             }
-            // rename or move
-            let res = undefined;
-            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-            if (oldPath.parentFolder===newPath.parentFolder) {
-                const [entityType, entityId, newName] = [oldPath.fileType, oldPath.fileEntity._id, newPath.fileName];
-                res = await this.api.renameEntity(identity, this.projectId, entityType, entityId, newName);
-            } else {
-                const [entityType, entityId, newParentFolderId] = [oldPath.fileType, oldPath.fileEntity._id, newPath.parentFolder._id];
-                res = await this.api.moveEntity(identity, this.projectId, entityType, entityId, newParentFolderId);
-            }
-            // update local cache
-            if (res?.type==='success') {
-                const newEntity = Object.assign(oldPath.fileEntity);
-                newEntity.name = newPath.fileName;
-                this.removeEntity(oldPath.parentFolder, oldPath.fileType, oldPath.fileEntity);
-                this.insertEntity(newPath.parentFolder, oldPath.fileType, newEntity);
-                this.notify([
-                    {type: vscode.FileChangeType.Deleted, uri: oldUri},
-                    {type: vscode.FileChangeType.Created, uri: newUri},
-                ]);
-            } else {
-                if (res?.message!==undefined) {
-                    vscode.window.showErrorMessage(res.message);
+            if (currentParent._id!==newPath.parentFolder._id) {
+                const intermediateExists=Object.values(FolderKeys).some(key=>((newPath.parentFolder as any)[key]??[]).some((item:FileEntity)=>item.name===entity.name));
+                if (intermediateExists) {
+                    const temporaryName=`.overleaf-sync-${randomUUID()}-${entity.name}`;
+                    requireSuccess(await this.api.renameEntity(identity,this.projectId,type,entity._id,temporaryName));
+                    entity.name=temporaryName;
                 }
+                requireSuccess(await this.api.moveEntity(identity,this.projectId,type,entity._id,newPath.parentFolder._id));
+                this.removeEntity(currentParent,type,entity); this.insertEntity(newPath.parentFolder,type,entity); currentParent=newPath.parentFolder;
             }
+            if (entity.name!==newPath.fileName) {
+                requireSuccess(await this.api.renameEntity(identity,this.projectId,type,entity._id,newPath.fileName));
+                entity.name=newPath.fileName;
+            }
+            this.notify([{type:vscode.FileChangeType.Deleted,uri:oldUri},{type:vscode.FileChangeType.Created,uri:newUri}]);
+        } catch (error:any) {
+            await this.refreshProjectTree().catch(()=>undefined);
+            const actual=this._resolveById(entity._id)?.path??`${currentParent.name}/${entity.name}`;
+            throw new NetworkRequestError('unknown-outcome',`Move/rename incomplete: ${error.message}. Current known path: ${actual}${backupUri?`. Replaced content is backed up at ${backupUri.fsPath}`:''}`);
         }
     }
 
-    async compile(force:boolean=false, draft:boolean=false, stopOnFirstError:boolean=false, rootDocId?:string) {
+    private compileRecoveryNeeded=false;
+    lastCompileStatus?:string;
+    lastCompileHasLog=false;
+
+    async compile(force:boolean=false, draft:boolean=false, stopOnFirstError:boolean=false, rootDocId?:string, signal?:AbortSignal) {
         if (force || (this.root && this.isDirty)) {
             this.isDirty = false;
-            let needCacheClearFirst = false;
-            try{
-                await this.resolve(this.pathToUri(OUTPUT_FOLDER_NAME, "output.log"));
-            }
-            catch (e) {
-                needCacheClearFirst = true;
-            }
+            let completed=false;
+            try {
+            this.lastCompileHasLog=false;
+            this.lastCompileStatus=undefined;
             const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-            // clear cache if needed
-            if (needCacheClearFirst) {
-                await this.api.deleteAuxFiles(identity, this.projectId);
-            }
             // compile project
             const resolvedRootDocId = rootDocId ?? this.root?.rootDoc_id ?? null;
             let rootResourcePath: string | null = null;
@@ -992,20 +1370,24 @@ export class VirtualFileSystem extends vscode.Disposable {
                     console.warn(`Unable to resolve root document id '${resolvedRootDocId}' to a path; compiling without explicit rootResourcePath.`);
                 }
             }
-            const res = await this.api.compile(identity, this.projectId, rootResourcePath, draft, stopOnFirstError);
-            if (res.type==='success' && res.compile?.status==='success') {
-                // Store CDN download info from the response for subsequent output file requests
-                this.compileGroup = res.compile.compileGroup;
-                this.clsiServerId = res.compile.clsiServerId;
-                this.pdfDownloadDomain = res.compile.pdfDownloadDomain;
-                this.updateOutputs(res.compile.outputFiles);
-                return true;
-            } else {
-                if (res.message!==undefined) {
-                    console.error('Compile failure.', res.message);
-                }
-                return false;
+            const res = await this.api.compile(identity, this.projectId, rootResourcePath, draft, stopOnFirstError,!force,!this.compileRecoveryNeeded,signal);
+            if (res.type!=='success' || !res.compile) {
+                this.compileRecoveryNeeded=true;
+                throw new NetworkRequestError(res.errorKind??'fatal-error',res.message??'Compile request failed',res.statusCode);
             }
+            this.lastCompileStatus=res.compile.status;
+            const status=res.compile.status;
+            this.compileRecoveryNeeded=!['success','stopped-on-first-error','autocompile-backoff','too-recently-compiled','compile-in-progress'].includes(status);
+            this.compileGroup=res.compile.compileGroup;
+            this.clsiServerId=res.compile.clsiServerId;
+            this.pdfDownloadDomain=res.compile.pdfDownloadDomain;
+            const outputs=res.compile.outputFiles??[];
+            if (outputs.length) { await this.updateOutputs(outputs); }
+            this.lastCompileHasLog=outputs.some(file=>file.path==='output.log');
+            completed=status==='success';
+            return completed;
+            } catch (error) { this.compileRecoveryNeeded=true; throw error;
+            } finally { if (!completed) { this.isDirty=true; } }
         }
         return Promise.resolve(undefined);
     }
@@ -1027,7 +1409,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (this.root) {
             // update output buildId
             // '/project/65dbfff719ad65b54b9eaed4/user/65094b5fa537faaba0bec01f/build/19620231e54-5372f67292889500/output/output.aux' --> 19620231e54-5372f67292889500'
-            this.outputBuildId = outputs[0].url.match(/\/build\/([^\/]+)/)?.[1];
+            this.outputBuildId = outputs[0]?.url.match(/\/build\/([^\/]+)/)?.[1];
 
             const rootFolder = this.root.rootFolder[0];
             if (this.removeEntityById(rootFolder, 'folder', __OUTPUTS_ID)) {
@@ -1083,15 +1465,22 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
+    private spellCheckUnavailable=false;
+
     async spellCheck(uri: vscode.Uri, words: string[]) {
+        if (this.spellCheckUnavailable) { return; }
         if (this.root?.spellCheckLanguage==='') { return []; }
 
         const {fileType} = await this._resolveUri(uri);
         if (fileType==='doc' || fileType==='file') {
             const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
             const res = this.root && await this.api.proxyRequestToSpellingApi(identity, this.root.spellCheckLanguage, this.userId, words);
-            if (res?.type==='success') {
+            if (res?.type==='success' && Array.isArray(res.misspellings)) {
                 return res.misspellings;
+            }
+            if (res?.statusCode===404 || res?.statusCode===405 || res?.statusCode===501) {
+                this.spellCheckUnavailable=true;
+                void vscode.window.showWarningMessage('This Overleaf server does not provide the legacy spell-check service. Built-in spelling checks are unavailable for this project; compilation is unaffected.');
             }
         }
     }
@@ -1164,7 +1553,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     setProjectSCMPersist(scmKey: string, persist: any) {
-        GlobalStateManager.updateServerProjectSCMPersist(this.context, this.serverName, this.projectId, scmKey, persist);
+        return GlobalStateManager.updateServerProjectSCMPersist(this.context, this.serverName, this.projectId, scmKey, persist);
     }
 
     async updateSettings(setting: any) {
@@ -1185,14 +1574,44 @@ export class VirtualFileSystem extends vscode.Disposable {
         return res.type==='success'? true : false;
     }
 
+    private scheduleMetadataRefresh(docId:string,delay=2000):void {
+        if (this.disposed || !this.root) { return; }
+        const tasks=this.metadataTasks??=new DebouncedTasks();
+        tasks.schedule(docId,delay,()=>{
+            if (this.metadataRunning.has(docId)) { this.scheduleMetadataRefresh(docId); return; }
+            const epoch=this.connectionEpoch;
+            if (!this.isConnectionReady || !this._resolveById(docId)) { return; }
+            this.metadataRunning.add(docId);
+            void (async()=>{
+                const identity=await GlobalStateManager.authenticate(this.context,this.serverName);
+                if (this.disposed || epoch!==this.connectionEpoch) { return; }
+                if (this.metadataRefreshUnavailable) {
+                    this.projectMetadata.reset();
+                    await this.metadata();
+                    return;
+                }
+                const broadcast=(this.clientManagerItem?.manager.collaboratorCount??0)>0;
+                const res=await this.api.refreshDocMetadata(identity,this.projectId,docId,broadcast);
+                if (this.disposed || epoch!==this.connectionEpoch) { return; }
+                if (res.type==='success' && res.meta?.projectMeta) {
+                    for (const [id,meta] of Object.entries(res.meta.projectMeta)) { this.projectMetadata.update({docId:id,meta}); }
+                } else if (res.type==='error' && [403,404,405,501].includes(res.statusCode??0)) {
+                    this.metadataRefreshUnavailable=true;
+                    this.projectMetadata.reset();
+                    await this.metadata();
+                    console.warn('Document metadata refresh is unavailable; using debounced project metadata reads');
+                }
+            })().catch(error=>console.warn('Unable to refresh document metadata',error))
+                .finally(()=>this.metadataRunning.delete(docId));
+        });
+    }
+
     async metadata() {
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-        const res = await this.api.getMetadata(identity, this.projectId);
-        if (res.type==='success') {
-            return res.meta?.projectMeta;
-        } else {
-            return undefined;
-        }
+        return this.projectMetadata.get(async()=>{
+            const identity=await GlobalStateManager.authenticate(this.context,this.serverName);
+            const res=await this.api.getMetadata(identity,this.projectId);
+            return res.type==='success'?res.meta?.projectMeta:undefined;
+        });
     }
 
     async getUpdates(before?: number) {
@@ -1311,6 +1730,13 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 }
 
+function sameRemoteRevision(left:RemoteRevision,right:RemoteRevision):boolean {
+    if (left.kind!==right.kind || left.contentHash!==right.contentHash) { return false; }
+    return left.kind==='document' && right.kind==='document'
+        ? left.documentVersion===right.documentVersion
+        : left.kind==='file' && right.kind==='file' && left.entityId===right.entityId;
+}
+
 export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
     private _emitter = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
     readonly onDidChangeFile: vscode.Event<vscode.FileChangeEvent[]> = this._emitter.event;
@@ -1322,13 +1748,25 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
         this.vfss = {};
     }
 
+    private cacheKey(uri:vscode.Uri):string {
+        // A query can contain the same user/project identifiers on different
+        // servers. Including the transport identity prevents cross-server VFS reuse.
+        return `${uri.scheme}\0${uri.authority}\0${uri.query}`;
+    }
+
     private getVFS(uri: vscode.Uri): Promise<VirtualFileSystem> {
-        const vfs = this.vfss[ uri.query ];
-        if (vfs) {
+        const key=this.cacheKey(uri);
+        const vfs = this.vfss[key];
+        if (vfs && !vfs.isDisposed) {
             return Promise.resolve(vfs);
         } else {
-            const vfs = new VirtualFileSystem(this.context, uri, this.notify.bind(this));
-            this.vfss[ uri.query ] = vfs;
+            let vfs: VirtualFileSystem;
+            vfs = new VirtualFileSystem(this.context, uri, this.notify.bind(this), () => {
+                if (this.vfss[key] === vfs) {
+                    delete this.vfss[key];
+                }
+            });
+            this.vfss[key] = vfs;
             return Promise.resolve(vfs);
         }
     }
@@ -1358,11 +1796,11 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
     }
 
     readFile(uri: vscode.Uri): Thenable<Uint8Array> {
-        return this.getVFS(uri).then( vfs => vfs.openFile(uri) );
+        return this.getVFS(uri).then( vfs => vfs.readEditorFile(uri) );
     }
 
     writeFile(uri: vscode.Uri, content: Uint8Array, options: { create: boolean; overwrite: boolean; }): Thenable<void> {
-        return this.getVFS(uri).then( vfs => vfs.writeFile(uri, content, options.create, options.overwrite) );
+        return this.getVFS(uri).then(async vfs => { await vfs.writeFile(uri, content, options.create, options.overwrite); });
     }
 
     delete(uri: vscode.Uri, options: { recursive: boolean; }): Thenable<void> {
@@ -1380,9 +1818,18 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
 
     get triggers() {
         return [
+            new vscode.Disposable(() => {
+                Object.values(this.vfss).forEach((vfs) => vfs.dispose());
+                this.vfss = {};
+                this._emitter.dispose();
+            }),
             // register file system provider
             vscode.workspace.registerFileSystemProvider(ROOT_NAME, this, { isCaseSensitive: true }),
             // register commands
+            vscode.commands.registerCommand(`${ROOT_NAME}.remoteFileSystem.retryConnection`,async(uri?:vscode.Uri)=>{
+                const targets=uri?.scheme===ROOT_NAME?[await this.getVFS(uri)]:Object.values(this.vfss).filter(vfs=>!vfs.isDisposed&&!vfs.isConnectionReady);
+                await Promise.all(targets.map(vfs=>vfs.retryInitialization()));
+            }),
             vscode.commands.registerCommand(`${ROOT_NAME}.remoteFileSystem.refreshLinkedFile`, (uri: vscode.Uri) => {
                 return this.prefetch(uri).then((vfs) => vfs.refreshLinkedFile(uri));
             }),

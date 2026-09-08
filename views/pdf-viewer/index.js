@@ -37,6 +37,44 @@
         pdfSidebarView: SidebarView.NONE,
     };
     let firstLoaded = true;
+    let compileState = {busy:false, message:''};
+    let loadingPdf = false;
+    let loadGeneration = 0;
+    let renderTimer;
+    let renderingDocument;
+    let pdfLoadError = "";
+    const rangeTransports = new Map();
+    let pendingLoadingTask;
+    let displayedLoadingTask;
+    let rangeRequestId = 0;
+
+    function showProgress() {
+        let overlay = document.getElementById('overleaf-progress');
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.id = 'overleaf-progress';
+            overlay.setAttribute('role', 'status');
+            overlay.setAttribute('aria-live', 'polite');
+            const panel = document.createElement('div');
+            panel.className = 'overleaf-progress-panel';
+            const spinner = document.createElement('span');
+            spinner.className = 'overleaf-spinner';
+            spinner.setAttribute('aria-hidden', 'true');
+            const label = document.createElement('span');
+            label.id = 'overleaf-progress-label';
+            const dismiss = document.createElement('button');
+            dismiss.textContent = 'Dismiss';
+            dismiss.onclick = () => { compileState.message = ''; pdfLoadError = ''; showProgress(); };
+            panel.append(spinner, label, dismiss);
+            overlay.append(panel);
+            document.body.append(overlay);
+        }
+        const busy = compileState.busy || loadingPdf;
+        overlay.hidden = !busy && !compileState.message && !pdfLoadError;
+        overlay.classList.toggle('busy', busy);
+        overlay.setAttribute('aria-busy', String(busy));
+        document.getElementById('overleaf-progress-label').textContent = loadingPdf ? 'Loading PDF…' : (pdfLoadError || compileState.message);
+    }
 
     function updatePdfViewerState() {
         const pdfViewerState = vscode.getState() || globalPdfViewerState;
@@ -148,19 +186,76 @@
         container.insertBefore(button, firstChild);
     }
 
-    async function updatePdf(pdf) {
-        const doc = await pdfjsLib.getDocument({
-            data: pdf,
+    function createRangeTransport(sourceId, range, initialData, failed) {
+        const transport = new pdfjsLib.PDFDataRangeTransport(range.length, new Uint8Array(initialData), true);
+        transport.requests = new Map();
+        transport.requestDataRange = (begin, end) => {
+            const requestId = ++rangeRequestId;
+            transport.requests.set(requestId, {begin, end});
+            vscode.postMessage({type:'pdfRange', sourceId, requestId, begin, end});
+        };
+        transport.abort = () => { transport.requests.clear(); rangeTransports.delete(sourceId); };
+        transport.failed = failed;
+        rangeTransports.set(sourceId, transport);
+        return transport;
+    }
+
+    async function updatePdf(pdf, range, sourceId) {
+        const generation = ++loadGeneration;
+        if (pendingLoadingTask && pendingLoadingTask !== displayedLoadingTask) { void pendingLoadingTask.destroy?.(); }
+        renderingDocument = undefined;
+        pdfLoadError = "";
+        loadingPdf = true;
+        showProgress();
+        clearTimeout(renderTimer);
+        renderTimer = setTimeout(() => {
+            if (generation !== loadGeneration) { return; }
+            loadingPdf = false;
+            pdfLoadError = 'PDF loading timed out; retry or reopen the preview';
+            showProgress();
+        }, 60000);
+        try {
+        let task;
+        const failed = () => {
+            if (generation !== loadGeneration) { return; }
+            clearTimeout(renderTimer);
+            loadingPdf = false;
+            pdfLoadError = 'PDF download failed or the file changed; recompile or reopen the preview';
+            showProgress();
+            void task?.destroy?.();
+        };
+        const input = range ? {
+            range: createRangeTransport(sourceId, range, pdf, failed),
+            length: range.length, rangeChunkSize: range.chunkSize,
+            disableStream: true, disableAutoFetch: true,
+        } : {data: pdf};
+        task = pdfjsLib.getDocument({
+            ...input,
             cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.10.111/cmaps/',
             cMapPacked: true
-        }).promise;
+        });
+        pendingLoadingTask = task;
+        const doc = await task.promise;
+        if (generation !== loadGeneration) { await doc.destroy(); return; }
         if (firstLoaded) {
             firstLoaded = false;
         } else {
             backupPdfViewerState();
         }
         PDFViewerApplication.isViewerEmbedded = true;
+        renderingDocument = doc;
+        const previousTask = displayedLoadingTask;
+        displayedLoadingTask = task;
         PDFViewerApplication.load(doc);
+        vscode.postMessage({type:'pdfLoaded', sourceId});
+        if (previousTask && previousTask !== task) { void previousTask.destroy?.(); }
+        } catch (error) {
+            if (generation !== loadGeneration) { return; }
+            clearTimeout(renderTimer);
+            loadingPdf = false;
+            pdfLoadError = 'PDF loading failed; please retry';
+            showProgress();
+        }
     }
 
     // Reference: https://github.com/James-Yu/LaTeX-Workshop/blob/master/viewer/latexworkshop.ts#L306
@@ -215,6 +310,13 @@
             const {eventBus, _boundEvents} = PDFViewerApplication;
             eventBus._off("beforeprint", _boundEvents.beforePrint);
             eventBus.on('documentloaded', updatePdfViewerState);
+            eventBus.on('pagerendered', (event) => {
+                if (!loadingPdf || !renderingDocument || PDFViewerApplication.pdfDocument !== renderingDocument
+                    || event.source !== PDFViewerApplication.pdfViewer.getPageView(event.pageNumber - 1)) { return; }
+                loadingPdf = false;
+                clearTimeout(renderTimer);
+                showProgress();
+            });
             // backup scale
             eventBus._on('scalechanged', backupPdfViewerState);
             eventBus._on("zoomin", backupPdfViewerState);
@@ -231,9 +333,29 @@
         window.addEventListener('message', async (e) => {
             const message = e.data;
             switch (message.type) {
-                case 'update':
-                    updatePdf(message.content);
+                case 'compileState':
+                    compileState = {busy:message.busy, message:message.message || ''};
+                    if (message.busy) { pdfLoadError = ''; }
+                    showProgress();
                     break;
+                case 'update':
+                    updatePdf(message.content, message.range, message.sourceId);
+                    break;
+                case 'pdfRange': {
+                    const transport = rangeTransports.get(message.sourceId);
+                    const request = transport?.requests.get(message.requestId);
+                    if (!request) { break; }
+                    transport.requests.delete(message.requestId);
+                    const content = new Uint8Array(message.content);
+                    if (request.begin !== message.begin || content.length !== request.end - request.begin) { transport.failed(); break; }
+                    transport.onDataRange(message.begin, content);
+                    break;
+                }
+                case 'pdfRangeError': {
+                    const transport = rangeTransports.get(message.sourceId);
+                    if (transport?.requests.has(message.requestId)) { transport.failed(); }
+                    break;
+                }
                 case 'syncCode':
                     syncCode(message.content);
                     break;
@@ -255,7 +377,8 @@
 
         // add mouse double click listener
         window.addEventListener('dblclick', (e) => {
-            const pageElem = e.target.parentElement.parentElement;
+            const pageElem = e.target.closest?.('.page');
+            if (!pageElem || !pageElem.querySelector('canvas')) { return; }
             const pageNum = pageElem.getAttribute('data-page-number');
             if (pageNum === null || pageNum === undefined) {
                 return;

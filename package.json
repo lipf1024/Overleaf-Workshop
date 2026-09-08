@@ -2,13 +2,13 @@
   "name": "overleaf-workshop",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.15.10",
+  "version": "0.16.19",
   "icon": "resources/icons/app_icon.png",
   "author": {
-    "name": "iamhyc",
-    "email": "ychong@petalmail.com"
+    "name": "lipf",
+    "email": "905937209@qq.com"
   },
-  "publisher": "iamhyc",
+  "publisher": "lipf1024",
   "contributors": [
     {
       "name": "iamhyc",
@@ -47,19 +47,20 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/overleaf-workshop/overleaf-workshop"
+    "url": "https://github.com/lipf1024/Overleaf-Workshop"
   },
   "bugs": {
-    "url": "https://github.com/overleaf-workshop/overleaf-workshop/issues"
+    "url": "https://github.com/lipf1024/Overleaf-Workshop/issues"
   },
   "engines": {
-    "vscode": "^1.80.0"
+    "vscode": "^1.101.0"
   },
   "categories": [
     "Other"
   ],
   "activationEvents": [
     "onFileSystem:overleaf-workshop",
+    "onFileSystem:overleaf-workshop-conflict",
     "workspaceContains:.overleaf/settings.json"
   ],
   "main": "./out/extension.js",
@@ -116,16 +117,79 @@
     ],
     "commands": [
       {
+        "command": "overleaf-workshop.localReplica.syncNow",
+        "title": "本地副本：立即同步",
+        "icon": "$(sync)",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.localReplica.reviewPending",
+        "title": "Local Replica: Review Pending Changes",
+        "icon": "$(list-unordered)",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.localReplica.setSyncMode",
+        "title": "本地副本：切换自动同步",
+        "icon": "$(settings-gear)",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.localReplica.openConflict",
+        "title": "Local Replica: Open Merge Editor",
+        "icon": "$(git-merge)",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.localReplica.markResolved",
+        "title": "%commands.localReplica.markResolved.title%",
+        "shortTitle": "%commands.localReplica.markResolved.shortTitle%",
+        "icon": "$(pass)",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.localReplica.markResolvedInEditor",
+        "title": "%commands.localReplica.markResolved.shortTitle%",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.localReplica.completeMerge",
+        "title": "%commands.localReplica.completeMerge.title%",
+        "shortTitle": "%commands.localReplica.completeMerge.shortTitle%",
+        "icon": "$(check)",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.localReplica.useLocal",
+        "title": "Local Replica: Use Local Version",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.localReplica.useRemote",
+        "title": "Local Replica: Use Overleaf Version",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.localReplica.retryFailed",
+        "title": "Local Replica: Retry Failed Sync",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.localReplica.showDiagnostics",
+        "title": "Local Replica: Show Sync Diagnostics",
+        "category": "%extension.displayName%"
+      },
+      {
         "command": "overleaf-workshop.remoteFileSystem.refreshLinkedFile",
-        "title": "%commands.remoteFileSystem.refreshLinkedFile.title%",
+        "title": "Refresh External Linked File",
         "icon": "$(refresh)",
-        "enablement": "focusedView == 'workbench.explorer.fileView' && (resourceScheme == overleaf-workshop || overleaf-workshop.activate)",
+        "enablement": "focusedView == 'workbench.explorer.fileView' && resourceScheme == overleaf-workshop",
         "category": "%extension.displayName%"
       },
       {
         "command": "overleaf-workshop.remoteFileSystem.createLinkedFile",
         "title": "%commands.remoteFileSystem.createLinkedFile.title%",
-        "enablement": "resourceScheme == overleaf-workshop || overleaf-workshop.activate",
+        "enablement": "resourceScheme == overleaf-workshop",
         "category": "%extension.displayName%"
       },
       {
@@ -252,6 +316,12 @@
         "category": "%extension.displayName%"
       },
       {
+        "command": "overleaf-workshop.projectManager.openProjectRemotely",
+        "title": "Open Project Remotely…",
+        "icon": "$(cloud)",
+        "category": "%extension.displayName%"
+      },
+      {
         "command": "overleaf-workshop.projectManager.openProjectInCurrentWindow",
         "title": "%commands.projectManager.openProjectInCurrentWindow.title%",
         "icon": "$(arrow-right)",
@@ -268,7 +338,7 @@
       {
         "command": "overleaf-workshop.projectManager.openProjectLocalReplica",
         "title": "%commands.projectManager.openProjectLocalReplica.title%",
-        "icon": "$(file-directory)",
+        "icon": "$(device-desktop)",
         "enablement": "viewItem == project || viewItem == project_in_tag",
         "category": "%extension.displayName%"
       },
@@ -393,6 +463,15 @@
         "title": "%commands.collaboration.jumpToUser.title%",
         "enablement": "resourceScheme == overleaf-workshop || overleaf-workshop.activate",
         "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.remoteFileSystem.retryConnection",
+        "title": "%commands.remoteFileSystem.retryConnection.title%"
+      },
+      {
+        "command": "overleaf-workshop.localReplica.reviewRecovery",
+        "title": "%commands.localReplica.reviewRecovery.title%",
+        "category": "%extension.displayName%"
       }
     ],
     "keybindings": [
@@ -421,121 +500,126 @@
         "when": "editorTextFocus && resourceScheme == overleaf-workshop"
       }
     ],
-    "configuration": {
-      "title": "%extension.displayName%",
-      "properties": {
-        "overleaf-workshop.compileOnSave.enabled": {
-          "type": "boolean",
-          "default": true,
-          "scope": "machine",
-          "markdownDescription": "%configuration.compileOnSave.enabled.markdownDescription%"
-        },
-        "overleaf-workshop.localReplica.syncOnFileChange.enabled": {
-          "type": "boolean",
-          "default": false,
-          "scope": "machine",
-          "markdownDescription": "%configuration.localReplica.syncOnFileChange.enabled.markdownDescription%"
-        },
-        "overleaf-workshop.compileOutputFolderName": {
-          "type": "string",
-          "default": ".output",
-          "scope": "machine",
-          "pattern": "^[^\\\\/:*?\"<>|]+$",
-          "markdownDescription": "%configuration.compileOutputFolderName.markdownDescription%"
-        },
-        "overleaf-workshop.pdfViewer.themes": {
-          "type": "object",
-          "default": {
-            "default": {
-              "fontColor": "#000000",
-              "bgColor": "#FFFFFF"
-            },
-            "light": {
-              "fontColor": "#000000",
-              "bgColor": "#F5F5DC"
-            },
-            "dark": {
-              "fontColor": "#FBF0D9",
-              "bgColor": "#4B4B4B"
-            }
+    "configuration": [
+      {
+        "title": "%configuration.common.title%",
+        "order": 10,
+        "properties": {
+          "overleaf-workshop.compileOnSave.enabled": {
+            "type": "boolean",
+            "default": true,
+            "scope": "machine",
+            "markdownDescription": "%configuration.compileOnSave.enabled.markdownDescription%"
           },
-          "patternProperties": {
-            "^[a-zA-Z0-9_-]+$": {
-              "type": "object",
-              "description": "%configuration.pdfViewer.themes.theme.description%",
-              "properties": {
-                "fontColor": {
-                  "type": "string",
-                  "format": "color",
-                  "description": "%configuration.pdfViewer.themes.fontColor.description%"
-                },
-                "bgColor": {
-                  "type": "string",
-                  "format": "color",
-                  "description": "%configuration.pdfViewer.themes.backgroundColor.description%"
+          "overleaf-workshop.compileOutputFolderName": {
+            "type": "string",
+            "default": ".output",
+            "scope": "machine",
+            "pattern": "^[^\\\\/:*?\"<>|]+$",
+            "markdownDescription": "%configuration.compileOutputFolderName.markdownDescription%"
+          },
+          "overleaf-workshop.pdfViewer.themes": {
+            "type": "object",
+            "default": {
+              "default": {
+                "fontColor": "#000000",
+                "bgColor": "#FFFFFF"
+              },
+              "light": {
+                "fontColor": "#000000",
+                "bgColor": "#F5F5DC"
+              },
+              "dark": {
+                "fontColor": "#FBF0D9",
+                "bgColor": "#4B4B4B"
+              }
+            },
+            "patternProperties": {
+              "^[a-zA-Z0-9_-]+$": {
+                "type": "object",
+                "description": "%configuration.pdfViewer.themes.theme.description%",
+                "properties": {
+                  "fontColor": {
+                    "type": "string",
+                    "format": "color",
+                    "description": "%configuration.pdfViewer.themes.fontColor.description%"
+                  },
+                  "bgColor": {
+                    "type": "string",
+                    "format": "color",
+                    "description": "%configuration.pdfViewer.themes.backgroundColor.description%"
+                  }
                 }
               }
-            }
+            },
+            "additionalProperties": false,
+            "scope": "machine",
+            "markdownDescription": "%configuration.pdfViewer.themes.markdownDescription%"
           },
-          "additionalProperties": false,
-          "scope": "machine",
-          "markdownDescription": "%configuration.pdfViewer.themes.markdownDescription%"
-        },
-        "overleaf-workshop.pdfViewer.defaultScrollMode": {
-          "type": "string",
-          "enum": [
-            "vertical",
-            "horizontal",
-            "wrapped",
-            "page"
-          ],
-          "default": "vertical",
-          "scope": "machine",
-          "markdownDescription": "%configuration.pdfViewer.defaultScrollMode.markdownDescription%"
-        },
-        "overleaf-workshop.pdfViewer.defaultSpreadMode": {
-          "type": "string",
-          "enum": [
-            "none",
-            "odd",
-            "even"
-          ],
-          "default": "none",
-          "scope": "machine",
-          "markdownDescription": "%configuration.pdfViewer.defaultSpreadMode.markdownDescription%"
-        },
-        "overleaf-workshop.invisibleMode.historyRefreshInterval": {
-          "type": "number",
-          "default": 3,
-          "scope": "machine",
-          "minimum": 1,
-          "maximum": 60,
-          "markdownDescription": "%configuration.invisibleMode.historyRefreshInterval.markdownDescription%"
-        },
-        "overleaf-workshop.invisibleMode.chatMessageRefreshInterval": {
-          "type": "number",
-          "default": 3,
-          "scope": "machine",
-          "minimum": 1,
-          "maximum": 60,
-          "markdownDescription": "%configuration.invisibleMode.chatMessageRefreshInterval.markdownDescription%"
-        },
-        "overleaf-workshop.invisibleMode.inactiveTimeout": {
-          "type": "number",
-          "default": 180,
-          "scope": "machine",
-          "minimum": 10,
-          "maximum": 3600,
-          "markdownDescription": "%configuration.invisibleMode.inactiveTimeout.markdownDescription%"
-        },
-        "overleaf-workshop.formatWithLineBreak.enabled": {
-          "type": "boolean",
-          "default": true,
-          "scope": "machine",
-          "markdownDescription": "%configuration.formatWithLineBreak.enabled.markdownDescription%"
+          "overleaf-workshop.pdfViewer.defaultScrollMode": {
+            "type": "string",
+            "enum": [
+              "vertical",
+              "horizontal",
+              "wrapped",
+              "page"
+            ],
+            "default": "vertical",
+            "scope": "machine",
+            "markdownDescription": "%configuration.pdfViewer.defaultScrollMode.markdownDescription%"
+          },
+          "overleaf-workshop.pdfViewer.defaultSpreadMode": {
+            "type": "string",
+            "enum": [
+              "none",
+              "odd",
+              "even"
+            ],
+            "default": "none",
+            "scope": "machine",
+            "markdownDescription": "%configuration.pdfViewer.defaultSpreadMode.markdownDescription%"
+          }
+        }
+      },
+      {
+        "title": "%configuration.localReplica.title%",
+        "order": 20,
+        "properties": {
+          "overleaf-workshop.localReplica.syncMode": {
+            "type": "string",
+            "enum": [
+              "safeAuto",
+              "manual"
+            ],
+            "enumItemLabels": [
+              "%configuration.localReplica.syncMode.safeAuto.label%",
+              "%configuration.localReplica.syncMode.manual.label%"
+            ],
+            "default": "safeAuto",
+            "scope": "resource",
+            "markdownDescription": "%configuration.localReplica.syncMode.markdownDescription%"
+          },
+          "overleaf-workshop.localReplica.enableCompileNPreview": {
+            "type": "boolean",
+            "default": false,
+            "scope": "resource",
+            "markdownDescription": "%configuration.localReplica.enableCompileNPreview.markdownDescription%"
+          }
+        }
+      },
+      {
+        "title": "%configuration.remote.title%",
+        "order": 30,
+        "properties": {
+          "overleaf-workshop.formatWithLineBreak.enabled": {
+            "type": "boolean",
+            "default": true,
+            "scope": "machine",
+            "markdownDescription": "%configuration.formatWithLineBreak.enabled.markdownDescription%"
+          }
         }
       }
-    },
+    ],
     "viewsContainers": {
       "activitybar": [
         {
@@ -571,17 +655,79 @@
       ]
     },
     "menus": {
+      "commandPalette": [
+        {
+          "command": "overleaf-workshop.localReplica.completeMerge",
+          "when": "false"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.markResolvedInEditor",
+          "when": "false"
+        }
+      ],
+      "scm/resourceState/context": [
+        {
+          "command": "overleaf-workshop.localReplica.openConflict",
+          "when": "scmProvider == overleafLocalReplica && scmResourceState == overleafConflict",
+          "group": "inline@1"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.markResolved",
+          "when": "scmProvider == overleafLocalReplica && scmResourceState == overleafConflict",
+          "group": "inline@2"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.markResolved",
+          "when": "scmProvider == overleafLocalReplica && scmResourceState == overleafConflict",
+          "group": "overleaf@1"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.useLocal",
+          "when": "scmProvider == overleafLocalReplica && scmResourceState == overleafConflict",
+          "group": "overleaf@2"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.useRemote",
+          "when": "scmProvider == overleafLocalReplica && scmResourceState == overleafConflict",
+          "group": "overleaf@3"
+        }
+      ],
       "explorer/context": [
         {
+          "command": "overleaf-workshop.localReplica.markResolved",
+          "when": "resource in overleaf-workshop.localReplica.conflictResources",
+          "group": "overleaf@0"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.syncNow",
+          "when": "overleaf-workshop.localReplicaWorkspace && resourceScheme == file",
+          "group": "overleaf@1"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.reviewPending",
+          "when": "overleaf-workshop.localReplicaWorkspace && resourceScheme == file",
+          "group": "overleaf@2"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.setSyncMode",
+          "when": "overleaf-workshop.localReplicaWorkspace && resourceScheme == file",
+          "group": "overleaf@3"
+        },
+        {
           "command": "overleaf-workshop.remoteFileSystem.refreshLinkedFile",
-          "when": "(resourceScheme == overleaf-workshop || overleaf-workshop.activate) && !explorerResourceIsFolder"
+          "when": "resourceScheme == overleaf-workshop && !explorerResourceIsFolder"
         },
         {
           "command": "overleaf-workshop.remoteFileSystem.createLinkedFile",
-          "when": "(resourceScheme == overleaf-workshop || overleaf-workshop.activate) && explorerResourceIsFolder"
+          "when": "resourceScheme == overleaf-workshop && explorerResourceIsFolder"
         }
       ],
       "editor/context": [
+        {
+          "command": "overleaf-workshop.localReplica.markResolved",
+          "when": "overleaf-workshop.localReplica.mergeActive || resource in overleaf-workshop.localReplica.conflictResources",
+          "group": "overleaf@1"
+        },
         {
           "command": "overleaf-workshop.collaboration.copyLineRef",
           "when": "resourceScheme == overleaf-workshop || overleaf-workshop.activate"
@@ -593,9 +739,14 @@
       ],
       "view/title": [
         {
+          "command": "overleaf-workshop.localReplica.syncNow",
+          "when": "view == workbench.explorer.fileView && overleaf-workshop.localReplicaWorkspace",
+          "group": "navigation@1"
+        },
+        {
           "command": "overleaf-workshop.projectManager.addServer",
           "when": "view == overleaf-workshop.projectManager",
-          "group": "navigation"
+          "group": "navigation@3"
         },
         {
           "command": "overleaf-workshop.projectSCM.configSCM",
@@ -614,6 +765,11 @@
         }
       ],
       "editor/title": [
+        {
+          "command": "overleaf-workshop.localReplica.markResolved",
+          "when": "overleaf-workshop.localReplica.mergeActive",
+          "group": "navigation@1"
+        },
         {
           "command": "overleaf-workshop.compileManager.compile",
           "when": "(resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex",
@@ -710,28 +866,23 @@
           "group": "1_editActions"
         },
         {
-          "command": "overleaf-workshop.projectManager.openProjectInCurrentWindow",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "command": "overleaf-workshop.projectManager.openProjectRemotely",
+          "when": "view == overleaf-workshop.projectManager && (viewItem == project || viewItem == project_in_tag)",
           "group": "inline@3"
         },
         {
-          "command": "overleaf-workshop.projectManager.openProjectInNewWindow",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "command": "overleaf-workshop.projectManager.openProjectLocalReplica",
+          "when": "view == overleaf-workshop.projectManager && (viewItem == project || viewItem == project_in_tag)",
           "group": "inline@4"
         },
         {
-          "command": "overleaf-workshop.projectManager.openProjectInCurrentWindow",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "command": "overleaf-workshop.projectManager.openProjectRemotely",
+          "when": "view == overleaf-workshop.projectManager && (viewItem == project || viewItem == project_in_tag)",
           "group": "1_openActions@1"
         },
         {
-          "command": "overleaf-workshop.projectManager.openProjectInNewWindow",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
-          "group": "1_openActions@2"
-        },
-        {
           "command": "overleaf-workshop.projectManager.openProjectLocalReplica",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "when": "view == overleaf-workshop.projectManager && (viewItem == project || viewItem == project_in_tag)",
           "group": "1_openActions@3"
         },
         {
@@ -764,6 +915,13 @@
           "when": "view == overleaf-workshop.projectHistory && viewItem =~ /historyItem(Labelled)?/",
           "group": "z_downloadAction"
         }
+      ],
+      "editor/content": [
+        {
+          "command": "overleaf-workshop.localReplica.markResolvedInEditor",
+          "when": "isMergeResultEditor && mergeEditorBaseUri =~ /^overleaf-workshop-conflict:/",
+          "group": "navigation@1"
+        }
       ]
     },
     "customEditors": [
@@ -783,13 +941,18 @@
     "download-pdfjs": "download -o views/pdf-viewer/vendor -e https://github.com/mozilla/pdf.js/releases/download/v3.10.111/pdfjs-3.10.111-dist.zip && cd views/pdf-viewer/vendor && patch -p1 < pdfjs-3.10.111-dist.patch",
     "download-latex-basics": "download -o data/vendor -s 1 -e https://github.com/jlelong/vscode-latex-basics/archive/refs/tags/v1.5.4.zip",
     "postinstall": "patch-package && npm run download-pdfjs && npm run download-latex-basics",
-    "vscode:prepublish": "npm run compile",
+    "apply-patches": "patch-package",
+    "vscode:prepublish": "node ./scripts/check-package-assets.cjs && npm run apply-patches && npm run compile",
     "update-l10n": "npx @vscode/l10n-dev export -o ./l10n ./src",
     "compile": "tsc -p ./ && cd views/chat-view && npm run build",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
-    "test": "node ./out/test/runTest.js",
+    "test:unit": "npm run compile && mocha --ui tdd \"out/test/unit/**/*.test.js\"",
+    "test:network": "npm run compile && mocha --ui tdd \"out/test/unit/network.test.js\"",
+    "test:socket": "npm run compile && mocha --ui tdd \"out/test/unit/socket.test.js\"",
+    "test:vscode": "npm run compile && node ./out/test/runTest.js",
+    "test": "mocha --ui tdd \"out/test/unit/**/*.test.js\"",
     "prepare": "husky install"
   },
   "dependencies": {
@@ -797,13 +960,13 @@
     "@unified-latex/unified-latex-util-parse": "^1.8.3",
     "@vscode/l10n": "^0.0.18",
     "diff-match-patch": "^1.0.5",
-    "form-data": "^4.0.6",
+    "fs-native-extensions": "1.5.1",
     "fuzzysearch": "^1.0.3",
     "mime-types": "^2.1.35",
     "minimatch": "^9.0.9",
     "prettier": "^3.1.1",
     "socket.io-client": "github:overleaf/socket.io-client#0.9.17-overleaf-5",
-    "undici": "^8.9.0",
+    "undici": "7.29.0",
     "uuid": "^14.0.0"
   },
   "devDependencies": {
@@ -815,7 +978,7 @@
     "@types/node": "20.2.5",
     "@types/socket.io-client": "^1.4.36",
     "@types/uuid": "^9.0.6",
-    "@types/vscode": "^1.80.0",
+    "@types/vscode": "1.101.0",
     "@typescript-eslint/eslint-plugin": "^5.59.8",
     "@typescript-eslint/parser": "^5.59.8",
     "@vscode/l10n-dev": "^0.0.31",
@@ -830,5 +993,8 @@
   "extensionKind": [
     "workspace",
     "ui"
+  ],
+  "enabledApiProposals": [
+    "contribEditorContentMenu"
   ]
 }

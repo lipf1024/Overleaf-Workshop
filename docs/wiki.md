@@ -5,8 +5,8 @@ The name of the extension is inspired by the well-known [LaTeX Workshop Extensio
 
 The aim of Overleaf Workshop is to provide a seamless experience for Overleaf users to enjoy the service of Overleaf in VS Code just like in the web browser, while benefiting from the powerful features and extensions of VS Code.
 
-
 ## Servers Management
+
 Besides the official Overleaf server provided on [https://www.overleaf.com](https://www.overleaf.com), we also support the access to self-hosted [Overleaf Community Edition](https://github.com/overleaf/overleaf/wiki) and [Overleaf Server Pro Edition](https://www.overleaf.com/for/enterprises) servers.
 
 > [!WARNING]
@@ -25,7 +25,8 @@ Then a input box will pop up, enter the server URL and press `Enter` to confirm 
 
 ![screenshot-add-server-input](assets/screenshot-add-server-inputbox.png)
 
- The server URL should be exact the same as the home page URL of the server. Here are some notes:
+The server URL should be exact the same as the home page URL of the server. Here are some notes:
+
 - The URL should always start with `https://` or `http://`.
 - The `www` subdomain is non-negligible, e.g., `https://overleaf.com` is not valid.
 - The unnecessary path of the URL should be removed, e.g., `https://www.overleaf.com/project` should be `https://www.overleaf.com`.
@@ -43,16 +44,18 @@ Notice that if you have logged in to the server, the login information will be r
 There are currently two ways to login to the server: login with email and password, and login with cookies.
 
 > [!WARNING]
-> According to the [open-source `passportLogin` design](https://github.com/overleaf/overleaf/blob/5fc2535842b2727cb1ec33ed5543ca614b4fc25b/services/web/app/src/Features/Authentication/AuthenticationController.js#L79) and observation of the login process, the email and password are sent to the server in ***plain text***, which implies that the server can ***see your password*** even if the connection is encrypted.
-> We highly suggest you aware of this risk and use a ***separate password*** for the server, or use [SSO login](https://www.overleaf.com/learn/how-to/Managing_your_Overleaf_emails_and_login_options#Logging_in_with_institutional_or_organizational_single_sign-on_(SSO)) instead.
+> According to the [open-source `passportLogin` design](https://github.com/overleaf/overleaf/blob/5fc2535842b2727cb1ec33ed5543ca614b4fc25b/services/web/app/src/Features/Authentication/AuthenticationController.js#L79) and observation of the login process, the email and password are sent to the server in **_plain text_**, which implies that the server can **_see your password_** even if the connection is encrypted.
+> We highly suggest you aware of this risk and use a **_separate password_** for the server, or use [SSO login](<https://www.overleaf.com/learn/how-to/Managing_your_Overleaf_emails_and_login_options#Logging_in_with_institutional_or_organizational_single_sign-on_(SSO)>) instead.
 
 > [!NOTE]
 > We are working on the webview-based login feature (to be appeared in `v1.0.0`). Please stay tuned.
 
 #### Login with Email and Password
+
 If you can login via email and password on the web browser, you can also login via email and password in VS Code. The exception is that Captcha is enabled on the server, then you have to [login with cookies](#login-with-cookies) instead.
 
 #### Login with Cookies
+
 As for the cases that Captcha is enabled on the server, or you want to login with SSO, you have to login with cookies from an already logged-in browser. The steps are as follows:
 
 ![screenshot-login-with-cookies](assets/login_with_cookie.png)
@@ -64,7 +67,7 @@ As for the cases that Captcha is enabled on the server, or you want to login wit
 2. Filter the listed items with `/project` and select the exact match.
 
 3. Check the "Cookie" under "Request Headers" of the selected item and copy its value to login.
-    > The format of the Cookie value would be like: `overleaf_session2=...` or `sharelatex.sid=...`
+   > The format of the Cookie value would be like: `overleaf_session2=...` or `sharelatex.sid=...`
 
 ### Logout from Server
 
@@ -93,7 +96,9 @@ As shown in the screenshot in the previous section, the normal / archived / tras
 Only trashed projects can be deleted, which means the project will be permanently removed from the server.
 
 For explicit transition rules, please refer to the following graph:
+
 > The solid lines indicate the action is available in the context menu, while the dashed lines indicate the action is available when hovered.
+
 ```mermaid
 graph LR;
 
@@ -114,6 +119,7 @@ Trashed-.->Deleted
 Right click on a project to rename it. The project name should be unique in the server.
 
 ### Project Tag Management
+
 To create a new tag, right click on the server and select `Create New Tag` in the context menu.
 
 The project tags are displayed as folders in the project list.
@@ -139,22 +145,21 @@ However, due to the [limitation of the virtual workspace](https://github.com/mic
 #### Open Project Locally
 
 > [!NOTE]
-> The Overleaf features are not completely enabled in a local folder. Specifically, the [compile](#compile-project), [PDF preview](#preview-document), [intellisense](#intellisense) and [project history](#history-of-changes) features are disabled by default.
-> 
-> Currently, there is no way to enable these features in a local folder, especially considering people would like to use the LaTeX Workshop extension in a local folder. If you are in demand of these features, please consider to create a discussion in the [GitHub Discussions](https://github.com/overleaf-workshop/Overleaf-Workshop/discussions)
+> Some Overleaf features are not enabled in a local folder. Compilation and PDF preview are disabled by default but can be enabled immediately in **Overleaf Workshop: Local Replica** settings. The extension's remote-project intellisense and project-history views remain unavailable for local files; local LaTeX extensions can provide equivalent language features.
 
 The "Open Project Locally" feature is provided via a [local replica](#local-replica). The local replica is a folder on your local machine with a `.overleaf` folder presence, which is kept in sync with the project on the Overleaf server.
 
 Please follow the steps below to setup a local replica and open the project locally:
+
 1. Right click on the project and select `Open Project Locally...` in the context menu. A dialog will pop up to ask you to select a folder to create the local replica, if you have not created one before.
 
-    ![screenshot-create-local-replica](assets/screenshot-create-local-replica.png)
+   ![screenshot-create-local-replica](assets/screenshot-create-local-replica.png)
 
 2. After confirm to create the local replica, a input box will pop up to ask you to choose the local parent folder to store the local replica. The auto-completion is supported with the start path as the root filesystem `/` (for Windows, it is actually `C:\`).
 
-    When the parent folder path is chosen, please click the `Check` button on the right upper corner to submit the path. Please make sure the parent folder is writable and the local replica path will be created under the parent folder as `${parentFolder}/${projectName}`. If the local replica path already exists, it will be overwritten.
+   When the parent folder path is chosen, please click the `Check` button on the right upper corner to submit the path. Please make sure the parent folder is writable and the local replica path will be created under the parent folder as `${parentFolder}/${projectName}`. Existing files are compared with Overleaf; conflicting versions require explicit resolution.
 
-    ![screenshots-setup-local-replica-folder](assets/screenshot-setup-local-replica-folder.png)
+   ![screenshots-setup-local-replica-folder](assets/screenshot-setup-local-replica-folder.png)
 
 3. After the local replica is created, a input box will pop up to ask you to choose the local replica folder to open. Then you can open the project locally.
 
@@ -166,11 +171,11 @@ In this section, we assume you have opened a project in a default way (i.e., in 
 
 In the file explorer, you can create, rename, delete, and move files and folders as usual. For example, you can drag and drop a file from outside to the file explorer to upload it to the server.
 
-All the operations will be synced to the Overleaf server in real time (unless you are in [invisible mode](#invisible-mode)), and any external changes from your collaborators will be synced to the file explorer as well.
+All the operations will be synced to the Overleaf server in real time, and any external changes from your collaborators will be synced to the file explorer as well.
 
 #### `Pro` Import / Refresh External Linked Files
 
-For the Overleaf Server Pro Edition server, you can [share files across project](https://www.overleaf.com/learn/how-to/Can_I_share_files_(e.g._.bib_and_some_graphics)_across_my_projects%3F) or [upload a file using an external URL](https://www.overleaf.com/learn/how-to/How_to_upload_a_file_using_an_external_URL).
+For the Overleaf Server Pro Edition server, you can [share files across project](<https://www.overleaf.com/learn/how-to/Can_I_share_files_(e.g._.bib_and_some_graphics)_across_my_projects%3F>) or [upload a file using an external URL](https://www.overleaf.com/learn/how-to/How_to_upload_a_file_using_an_external_URL).
 
 ![screenshot-pro-import-external-file](assets/screenshot-pro-import-external-file.png)
 
@@ -178,7 +183,7 @@ In the Overleaf Workshop extension, the linked files are displayed in the file e
 
 ![screenshot-pro-refresh-external-file](assets/screenshot-pro-refresh-external-file.png)
 
-You can also right click on a folder to import a linked file via **"Overleaf: Import File ..."**, then it will prompt you to import a file from *another project* or *external URL*.
+You can also right click on a folder to import a linked file via **"Overleaf: Import File ..."**, then it will prompt you to import a file from _another project_ or _external URL_.
 
 ### Compile the Project
 
@@ -268,7 +273,7 @@ When there are other collaborators (or your other login sessions) online, the co
 ![screenshot-online-collaborators](assets/screenshot-online-collaborators.png)
 
 The online collaborators information is displayed on the status bar. The item icon shows the number of online collaborators, and the color represents the latest active collaborator.
-You can hover on the item like below to see the detailed information of the online collaborators, and click the text like `@xxx` to cite the collaborator [in the chat view](#chat-with-collaborators), or click the text like `main.tex#L1` to jump to the exact position of the collaborator. 
+You can hover on the item like below to see the detailed information of the online collaborators, and click the text like `@xxx` to cite the collaborator [in the chat view](#chat-with-collaborators), or click the text like `main.tex#L1` to jump to the exact position of the collaborator.
 
 #### Chat with Collaborators
 
@@ -295,8 +300,9 @@ There are multiple functions provided in the history view:
 ## Advanced Usage
 
 ### Advance Chat Message
+
 > [!NOTE]
-> This feature is not supported by Overleaf, and the format of the chat message is *ugly* on the Overleaf web editor.
+> This feature is not supported by Overleaf, and the format of the chat message is _ugly_ on the Overleaf web editor.
 
 To enhance the experience of collaboration via chat, we propose the following advanced features based on custom chat message format.
 
@@ -309,6 +315,7 @@ To enhance the experience of collaboration via chat, we propose the following ad
 ![screenshot-advance-chat](assets/screenshot-advance-chat.png)
 
 ### Local Replica (Source Control)
+
 > [!WARNING]
 > This feature is not considered robust yet, and may not work as expected, especially under unstable network environment.
 > Please use it with caution.
@@ -323,41 +330,31 @@ In the Local Replica configuration, you can choose to enable/disable the Local R
 
 ![screenshot-config-local-replica](assets/screenshot-config-local-replica.png)
 
+#### Resolving synchronization conflicts
+
+Conflicts appear in the **Conflicts** group in Source Control. A warning offers to open the merge editor, including when unresolved conflicts are restored after restarting VS Code. The Explorer and editor tabs use the theme's conflict color and a `!` badge; a status bar item shows the conflict count.
+
+The 0.16.6 local build adds a **Mark as Resolved** button inside the native **Result** pane. VS Code currently gates this location behind the `contribEditorContentMenu` proposed API. Enable it for this extension as described in [NATIVE_MERGE_BUTTON.md](../NATIVE_MERGE_BUTTON.md); installing the VSIX alone does not activate the in-page button.
+
+1. Select the conflicted file in Source Control, or run **Local Replica: Open Merge Editor**.
+2. Review the local and Overleaf versions in VS Code's native three-way merge editor. The input versions are read-only; the result is an editable draft. Use the native controls to accept either side, combine changes, or edit the result.
+3. Click **Mark as Resolved** inside the **Result** pane. This applies the merged result and clears the conflict after synchronization is verified. The action also appears in the status bar, beside the conflict in Source Control, in the Explorer and editor context menus, and as **Local Replica: Mark Conflict as Resolved** in the Command Palette. If you use VS Code's own **Complete Merge** command, choose **Mark as Resolved** in the follow-up notification.
+
+Saving or closing the merge editor preserves the draft and keeps the file in conflict. You can mark a saved merge as resolved from the conflicted file even after closing the editor or restarting VS Code. The original file remains editable for manual work, but saving it, running **Sync Now**, or restarting VS Code will not upload unresolved changes. If either version changes again, the draft is preserved and must be reviewed against the updated versions before it can be applied. A failed synchronization keeps the conflict marked until verification succeeds.
+
+Binary files use a VS Code picker to keep the local version, use the Overleaf version, or save a separate copy of the Overleaf version. **Use Local Version** and **Use Overleaf Version** are also available from a conflict's Source Control context menu.
+
 The project-related metadata for local replica are located in `.overleaf/settings.json` in the following format:
+
 ```json
 {
-    "uri": "overleaf-workshop://overleaf.com/example-project?user%3D<user_id>%26project%3D<project_id>",
-    "serverName": "overleaf.com",
-    "enableCompileNPreview": false,
-    "projectName": "example-project",
+  "uri": "overleaf-workshop://overleaf.com/example-project?user%3D<user_id>%26project%3D<project_id>",
+  "serverName": "overleaf.com",
+  "projectName": "example-project"
 }
 ```
-Most of the items are immutable, except for `enableCompileNPreview`, which is used to enable/disable the compile and preview feature in local folder. The default value is `false`.
 
-### Invisible Mode
-> [!WARNING]
-> This feature is not considered robust yet, and may not work as expected, especially under unstable network environment.
-> Please use it with caution.
-
-The Invisible Mode is a feature to disconnect the websocket connection to the server, and use the REST API to communicate with the server instead. This makes you fully invisible to other collaborators, unless you upload the local changes to the server.
-
-You can enter/exist the invisible mode via clicking the collaborator icon on the status bar.
-The chat messages and history of changes are refreshed periodically in the invisible mode. You can configure the refresh interval in the [vscode settings](#configurations). So when collaborators send you messages or make changes to the project, you can see the changes reflected in the chat view, history view, and file explorer.
-
-![screenshot-enter-invisible-mode](assets/screenshot-enter-invisible-mode.png)
-
-In invisible mode, after you make changes locally, you have to upload the changes manually to the server by clicking the upload button on the status bar, otherwise the changes will not be synced to the server.
-The remote changes will be first fetched from the server, merged with the local changes, and then uploaded to the server.
-
-![screenshots-invisible-mode-status](assets/screenshot-invisible-mode-status.png)
-
-However, Invisible Mode is not a perfect solution for offline editing. You should be aware of the following limitations:
-- You cannot see other collaborators' cursors;
-- You cannot rename/delete files or folders created by other collaborators until you reload the project
-  > or you can edit the file once to refresh the file metadata.
-- Your local update is always force-upload and cause online collaborators out-of-sync;
-  > while collaborators using this extension will not be affected.
-- The remote update of "compiler or spell language settings" will not be updated locally;
+These association fields are maintained by the extension. Older replicas may also contain `enableCompileNPreview`; it is migrated to the VS Code **Overleaf Workshop: Local Replica** settings group. The setting can be changed there and takes effect immediately.
 
 ### Commands and Shortcuts
 
@@ -378,28 +375,35 @@ Let us know if you have any suggestions for the commands and shortcuts in the [G
 
 ### Configurations
 
-The project-irrelevant configurations of the extension can be found in the VS Code settings (after `v0.8.0`). The configurations are only allowed to be changed in the user profile but not the workspace profile, in order to avoid accidentally uploading `.vscode` folder to the Overleaf server.
+The extension settings are separated into **Common**, **Local Replica**, and **Remote Project** groups. Local-replica settings can be stored per workspace folder; `.vscode` is excluded from replica synchronization.
 
 ![screenshot-vscode-configurations](assets/screenshot-vscode-configurations.png)
 
-- **"Compile On Save"**: This configuration is used to enable/disable the compile on save feature. The default value is `true`.
-- **Compile Output Folder Name**: This configuration is used to change the name of the output folder. The default value is `.output`. It takes effect after restarting VS Code.
-- **Invisible Mode: Chat Message Refresh Interval**: This configuration is used to change the refresh interval of the chat messages in the invisible mode. The default value is `3` (3 seconds).
-- **Invisible Mode: History Refresh Interval**: This configuration is used to change the refresh interval of the history of changes in the invisible mode. The default value is `3` (3 seconds).
-- **Invisible Mode: Inactive Timeout**: This configuration is used to mark a online collaborator as inactive for a certain period of time. The default value is `180` (180 seconds).
+#### Common
+
+- **Compile On Save**: Enable or disable compilation after saving. The default is `true`.
+- **Compile Output Folder Name**: Change the virtual compiled-output folder name. The default is `.output`.
 - **PDF Viewer: Themes**: This configuration is used to change the supported sthemes of the PDF viewer. The default value is as follows:
-    ```json
-    "default": {
-        "default": {"fontColor":"#000000", "bgColor":"#FFFFFF"},
-        "light":   {"fontColor":"#000000", "bgColor":"#F5F5DC"},
-        "dark":    {"fontColor":"#FBF0D9", "bgColor":"#4B4B4B"}
-    }
-    ```
+  ```json
+  "default": {
+      "default": {"fontColor":"#000000", "bgColor":"#FFFFFF"},
+      "light":   {"fontColor":"#000000", "bgColor":"#F5F5DC"},
+      "dark":    {"fontColor":"#FBF0D9", "bgColor":"#4B4B4B"}
+  }
+  ```
 - **PDF Viewer: Default Scroll Mode**: This configuration controls the default scroll mode for the PDF viewer when there is no saved viewer state for the PDF. Allowed values are `vertical`, `horizontal`, `wrapped`, and `page`. The default value is `vertical`.
 - **PDF Viewer: Default Spread Mode**: This configuration controls the default spread mode for the PDF viewer when there is no saved viewer state for the PDF. Allowed values are `none`, `odd`, and `even`. The default value is `none`.
+
+#### Local Replica
+
+- **Sync Mode**: Choose `Automatic (Safe)` or `Manual` synchronization for each local replica.
+- **Enable Compile And PDF Preview**: Enable Overleaf compilation and PDF preview for the local replica. Changes take effect immediately.
+
+#### Remote Project
+
 - **Formatter: Line break**: The formatter will restrict line length as 80 characters in default. Toggle the following option will disable this feature.
 
-    ![alt text](assets/screenshot-formatter-linebreak.png)
+  ![alt text](assets/screenshot-formatter-linebreak.png)
 
 ## FAQ
 
@@ -411,20 +415,18 @@ The compiled PDF `output.pdf` is located in the output folder, which is `.output
 
 P.S. The compile is also automatically triggered when you save a `.tex` file. This feature is enabled by default, and can be disabled in the vscode settings.
 
-
 #### Q2: Why my VS Code plugin (e.g., `vscode-texlint`, `latex-utilities`) does not work?
 
 **A2**: Due to the [limitation of the virtual workspace](https://github.com/microsoft/vscode/wiki/Virtual-Workspaces#signal-whether-your-extension-can-handle-virtual-workspaces), most of the existing VS Code extensions does not work in the virtual workspace. In this case, you can choose to [open the project locally](#open-project-locally) as a workaround.
 
-Please notice that not all Overleaf features enabled in a local folder. More specifically, the [compile](#compile-project), [PDF preview](#preview-document), [intellisense](#intellisense) and [project history](#history-of-changes) features are disabled by default. You need to refer to [LaTeX Workshop Extension](https://github.com/James-Yu/LaTeX-Workshop) as a complement.
-
+Compilation and PDF preview for a local replica can be enabled in **Overleaf Workshop: Local Replica** settings. The extension's remote-project intellisense and project-history views remain unavailable for local files, so you can use [LaTeX Workshop Extension](https://github.com/James-Yu/LaTeX-Workshop) or another local LaTeX extension as a complement.
 
 #### Q3: Why the extension loses connection to the server frequently or loading indefinitely?
 
 **A3**: It depends on your network environment. If you are suffering from the frequent disconnection or indefinite loading, please try the following solutions:
+
 - Ping the Overleaf server domain (e.g., `www.overleaf.com`) to see if the DNS is resolved correctly and the server is reachable.
 - Remove the `Http: proxy` in the VS Code settings.
 - Enable/Disable the network proxy for VS Code (or the Overleaf server domain) globally.
-- Try [Invisible Mode](#invisible-mode), which does not use WebSocket to communicate with the server.
 
 If the above solutions do not work, please consider to create a bug report in the [GitHub Issues](https://github.com/overleaf-workshop/Overleaf-Workshop/issues/new/choose).

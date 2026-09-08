@@ -90,6 +90,8 @@ The definition of the overleaf server public API.
 The implementation of web RESTful API used by overleaf server.
 The implementation is carried out with the help of [overleaf web router list](webapi.md) and the browser developer tools, and is loosely coupled with the extension for reuse in other projects.
 
+For the current request inventory, production callers, timeout/retry policies, and compatibility findings against a pinned Overleaf source revision, see [Network Requests and Official Source Audit](network-requests.md). The older route list is a historical reference, not a supported public API specification.
+
 **Interfaces**
 
 All the interfaces defined with `Schema` define the response schema from the server.
@@ -102,9 +104,9 @@ The `class BaseAPI` is the the only export class in this file, whose function ca
 - **utility functions**: `setIdentity` which alter the global identity when necessary, `request` to apply http request with proper credentials, `download` to download large files possible with `206 Partial Content` status code
 - **login-related API**: `(private async) getCsrfToken`, `(private async) getUserId`, `(async) passportLogin`, `(async) cookiesLogin`, `(async) updateCookies`, `(async) logout`
 - **project management API**: `(async) userProjectsJson / getProjectsJson`, `(async) newProject`, `(async) renameProject`, `(async) deleteProject`, `(async) archiveProject`, `(async) unarchiveProject`, `(async) trashProject`, `(async) untrashProject`, `(async) getAllTags`, `(async) createTag`, `(async) renameTag`, `(async) deleteTag`, `(async) addProjectToTag`, `(async) removeProjectFromTag`
-- **project editing API**: `(async) getFile`, `(async) addDoc`, `(async) uploadFile`, `(async) uploadProject`, `(async) addFolder`, `(async) deleteEntity`, `(async) deleteAuxFiles`, `(async) renameEntity`, `(async) moveEntity`, `(async) getFileFromClsi`, 
-- **compile-related API**: `(async) compile`, `(async) indexAll`, `(async) proxySyncPdf`, `(async) proxySyncCode`
-- **project history API**: `(async) proxyToHistoryApiAndGetUpdates`, `(async) proxyToHistoryApiAndGetFileDiff`, `(async) proxyToHistoryApiAndGetFileTreeDiff`, `(async) downloadZipOfVersion`, `(async) getLabels`, `(async) createLabel`, `(async) deleteLabel`
+- **project editing API**: `(async) getFile`, `(async) addDoc`, `(async) uploadFile`, `(async) uploadProject`, `(async) addFolder`, `(async) deleteEntity`, `(async) renameEntity`, `(async) moveEntity`, `(async) getFileFromClsi`
+- **compile-related API**: `(async) compile`, `(async) proxySyncPdf`, `(async) proxySyncCode`
+- **project history API**: `(async) proxyToHistoryApiAndGetUpdates`, `(async) proxyToHistoryApiAndGetFileDiff`, `(async) proxyToHistoryApiAndGetFileTreeDiff`, `(async) downloadZipOfVersion`, `(async) createLabel`, `(async) deleteLabel`
 - **intellisense API**: `(async) getMetadata`, `(async) proxyRequestToSpellingApi`, `(async) spellingControllerLearn`, `(async) spellingControllerUnlearn`
 - **chat message API**: `(async) getMessages`, `(async) sendMessage`
 - **project settings API**: `(async) getProjectSettings`, `(async) updateProjectSettings`
@@ -133,36 +135,7 @@ The `class SocketIOAPI` is the only export class in this file, which uses a stan
 Specifically, the purposes of the major methods are listed below:
 - **public methods**
   - send events to server and get response: `(async) joinProject`, `(async) joinDoc`, `(async) leaveDoc`, `(async) applyOtUpdate`, `(async) getConnectedUsers`, `(async) updatePosition`
-  - [alternative socketio](#srcapisocketioaltts) proxy: `(get) unSyncFileChanges`, `(async) syncFileChanges`
   - `updateEventHandlers`: mapping from the `socketio` event names to the aggregated events defined in `interface EventsHandler`
-
-
-#### `src/api/socketioAlt.ts`
-As the name suggests, this file provides an alternative implementation of the `socketio` API used by overleaf server, via http requests instead of websocket.
-
-**Types**
-
-The two types `type EmitEventsSupport` and `type ListenEventsSupport` define the events that the client would emit to server and listen from server, respectively.
-Considering the restrictions of the public API (some API used by `socketio` is marked as *private* and not exposed), there are some shortcomings of the alternative implementation:
-- Due to the nature of http requests, the client would periodically poll the server for the events (e.g., 3 seconds), instead of listening to the events in real time.
-- The new folder created by other collaborators would not be shown in the file tree, and so does the new files created inside the new folder.
-- The cursor position of other collaborators would not be shown in the editor, and so does the local client's cursor position.
-- The editing changes would be applied to remote server via *force overwrite* instead of *diff & patch*, and your collaborators would suffer from the "external update" and have to refresh the webpage, unless they are using this vscode extension
-
-**Class**
-
-The `class SocketIOAlt` is the only export class in this file, whose implementation is tightly coupled with the [virtual filesystem](#srccoreremotefilesystemproviderts), and hence highly depends on the `vscode` API.
-The `class SocketIOAlt` extends the interface of native `socket.io-client`: `emit`, `on` and `disconnect`, and also fulfil the interface of `class SocketIOAPI` for alternative implementation.
-
-Specifically, the purposes of the major methods are listed below:
-- **public methods**
-  - `(constructor)`: init the Timeout tasks to periodically apply the http requests and emit events for extension usage.
-  - `emit`, `on`, `disconnect`: emit the events in `type EmitEventsSupport`, listen to the events in `type ListenEventsSupport`, and imitate the socket disconnection, respectively.
-  - `(get) unSyncedChanges`: return the number of un-synced changes.
-  - `(async) uploadToVFS`: upload the changes to the overleaf server using `uploadFile` API, and emit `reciveNewDoc` for extension usage.
-- **private methods**
-  - `(get) randomEntityId`, `(get) vfs`: utility functions, provide pseudo entity ID and asynchronous vfs access, respectively.
-  - `(async) refreshVFS`, `(async) refreshMessages`: the Timeout tasks, periodically fetch project history and message list, respectively.
   - `watchConfigurations`: watch the vscode configuration changes on refresh intervals, and reset the task interval when necessary.
 
 ### `src/collaboration`

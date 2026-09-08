@@ -277,6 +277,7 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
                 if (!uri) { return; }
                 const version = item.version;
                 const content = await this.vfs.downloadProjectArchive(version);
+                if (!content) { throw new Error(vscode.l10n.t('Failed to download project archive.')); }
                 const filename = `${this.vfs.projectName}-v${version}.zip`;
 
                 const savePath = await vscode.window.showSaveDialog({
@@ -356,6 +357,8 @@ export class HistoryViewProvider {
         this.treeDataProvider = treeDataProvider;
         this.updateView();
     }
+
+    dispose():void { this.historyView.dispose(); }
 
     updateView(pathParts?: string[]) {
         this.historyView.description = pathParts?.at(-1);

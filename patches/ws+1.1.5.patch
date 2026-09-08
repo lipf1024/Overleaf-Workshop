@@ -1,0 +1,79 @@
+diff --git a/node_modules/ws/lib/WebSocket.js b/node_modules/ws/lib/WebSocket.js
+index 819fcef..623405a 100644
+--- a/node_modules/ws/lib/WebSocket.js
++++ b/node_modules/ws/lib/WebSocket.js
+@@ -584,7 +584,8 @@ function initAsClient(address, protocols, options) {
+     ciphers: null,
+     rejectUnauthorized: null,
+     perMessageDeflate: true,
+-    localAddress: null
++    localAddress: null,
++    maxPayload: 16 * 1024 * 1024
+   }).merge(options);
+ 
+   if (options.value.protocolVersion !== 8 && options.value.protocolVersion !== 13) {
+@@ -609,6 +610,7 @@ function initAsClient(address, protocols, options) {
+ 
+   // expose state properties
+   this._isServer = false;
++  this.maxPayload = options.value.maxPayload;
+   this.url = address;
+   this.protocolVersion = options.value.protocolVersion;
+   this.supports.binary = (this.protocolVersion !== 'hixie-76');
+diff --git a/node_modules/ws/lib/Receiver.js b/node_modules/ws/lib/Receiver.js
+index 9956f90..e042f4a 100644
+--- a/node_modules/ws/lib/Receiver.js
++++ b/node_modules/ws/lib/Receiver.js
+@@ -46,6 +46,8 @@ function Receiver (extensions,maxPayload) {
+   });
+   this.extensions = extensions || {};
+   this.maxPayload = maxPayload || 0;
++  this.maxFragments = 16 * 1024;
++  this.maxBufferedChunks = 32 * 1024;
+   this.currentPayloadLength = 0;
+   this.state = {
+     activeFragmentedOperation: null,
+@@ -86,13 +88,21 @@ Receiver.prototype.add = function(data) {
+   var dataLength = data.length;
+   if (dataLength == 0) return;
+   if (this.expectBuffer == null) {
++    if (this.overflow.length >= this.maxBufferedChunks) {
++      this.error('maximum buffered WebSocket chunks exceeded', 1009);
++      return;
++    }
+     this.overflow.push(data);
+     return;
+   }
+   var toRead = Math.min(dataLength, this.expectBuffer.length - this.expectOffset);
+   fastCopy(toRead, data, this.expectBuffer, this.expectOffset);
+   this.expectOffset += toRead;
+   if (toRead < dataLength) {
++    if (this.overflow.length >= this.maxBufferedChunks) {
++      this.error('maximum buffered WebSocket chunks exceeded', 1009);
++      return;
++    }
+     this.overflow.push(data.slice(toRead));
+   }
+   while (this.expectBuffer && this.expectOffset == this.expectBuffer.length) {
+@@ -512,6 +522,10 @@ var opcodes = {
+             return self.error(err.message, 1007);
+           }
+           if (buffer != null) {
++            if (self.currentMessage.length >= self.maxFragments) {
++              self.error('maximum WebSocket message fragments exceeded', 1009);
++              return;
++            }
+             if( self.maxPayload==0 || (self.maxPayload > 0 && (self.currentMessageLength + buffer.length) < self.maxPayload) ){
+               self.currentMessage.push(buffer);
+             }
+@@ -608,6 +622,10 @@ var opcodes = {
+             return self.error(err.message, 1007);
+           }
+           if (buffer != null) {
++            if (self.currentMessage.length >= self.maxFragments) {
++              self.error('maximum WebSocket message fragments exceeded', 1009);
++              return;
++            }
+             if( self.maxPayload==0 || (self.maxPayload > 0 && (self.currentMessageLength + buffer.length) < self.maxPayload) ){
+               self.currentMessage.push(buffer);
+             }

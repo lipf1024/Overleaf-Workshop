@@ -1,6 +1,11 @@
 .vscode/**
 .vscode-test/**
+.claude/**
+.github/**
+.husky/**
+commitlint.config.js
 src/**
+out/test/**
 patches/**
 docs/**
 .gitignore
@@ -9,6 +14,7 @@ docs/**
 **/.eslintrc.json
 **/*.map
 **/*.ts
+**/yarn-error.log
 
 data/vendor/**
 !data/vendor/LICENSE*
@@ -22,3 +28,7 @@ views/pdf-viewer/vendor/web/standard_fonts
 
 views/chat-view/**
 !views/chat-view/dist/**
+
+scripts/**
+views/pdf-viewer/vendor/*.patch
+*.vsix.sha256

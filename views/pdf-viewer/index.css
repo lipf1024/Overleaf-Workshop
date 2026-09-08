@@ -23,3 +23,43 @@ html, body {
 #secondaryDownload {
     display: none;
 }
+
+#overleaf-progress {
+    position: fixed;
+    inset: 32px 0 0;
+    z-index: 10000;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding-top: 24px;
+    pointer-events: none;
+}
+#overleaf-progress[hidden] { display: none; }
+#overleaf-progress.busy { background: rgba(100, 100, 100, 0.12); }
+.overleaf-progress-panel {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    border-radius: 6px;
+    color: var(--vscode-editorWidget-foreground, #222);
+    background: var(--vscode-editorWidget-background, #fff);
+    border: 1px solid var(--vscode-widget-border, #aaa);
+    box-shadow: 0 3px 12px #0003;
+    font: 13px system-ui, sans-serif;
+    pointer-events: auto;
+}
+.overleaf-spinner {
+    width: 16px;
+    height: 16px;
+    border: 2px solid var(--vscode-widget-border, #aaa);
+    border-top-color: var(--vscode-progressBar-background, #0078d4);
+    border-radius: 50%;
+    animation: overleaf-spin 0.8s linear infinite;
+}
+#overleaf-progress:not(.busy) .overleaf-spinner,
+#overleaf-progress.busy button { display: none; }
+@keyframes overleaf-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+    .overleaf-spinner { animation-duration: 2s; }
+}

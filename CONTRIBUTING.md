@@ -38,8 +38,8 @@ To make a contribution to this project, please follow the steps below:
 ## Development Guidance
 
 ### Prerequisites
-- [Node.js LTS](https://nodejs.org/en/) (>= 20.10.0)
-- Visual Studio Code (>= 1.80.0)
+- [Node.js LTS](https://nodejs.org/en/) (>= 22.15.0)
+- Visual Studio Code (>= 1.101.0)
   > Recommended extensions: [ESLint](https://marketplace.visualstudio.com/items?itemName=dbaeumer.vscode-eslint), [JavaScript and TypeScript Nightly](https://marketplace.visualstudio.com/items?itemName=ms-vscode.vscode-typescript-next), [Vue Language Features (Volar)](https://marketplace.visualstudio.com/items?itemName=Vue.volar), [TypeScript Vue Plugin (Volar)](https://marketplace.visualstudio.com/items?itemName=Vue.vscode-typescript-vue-plugin)
 - Operating System with common Unix commands.
   > If you are using Windows, please refer to [Windows Subsystem for Linux](https://docs.microsoft.com/en-us/windows/wsl/install-win10), [Cygwin](https://www.cygwin.com/) or [Git Bash](https://gitforwindows.org/).
@@ -68,6 +68,16 @@ vsce package
 
 ### Testing
 In VSCode, press <kbd>F5</kbd> to start debugging. A new VSCode window will be opened with the extension loaded.
+
+Run `npm test` for the build, lint, and unit tests. Run `npm run test:vscode` for the extension-host tests, including the native conflict editor. The latter creates separate user-data and extension directories in the OS temporary directory, enables `contribEditorContentMenu`, and uses simulated local/remote files. `VSCODE_TEST_VERSION=1.101.0` selects the minimum declared version; omit it to download the current stable version. Neither test mode uses an existing signed-in profile.
+
+To use an existing VS Code installation instead of downloading one, set `VSCODE_EXECUTABLE_PATH` to its executable. For example, on macOS:
+
+```bash
+env -u ELECTRON_RUN_AS_NODE VSCODE_EXECUTABLE_PATH='/Applications/Visual Studio Code.app/Contents/MacOS/Electron' npm run test:vscode
+```
+
+The B01–B13 regression cases live in `src/test/unit/replicaRobustness.test.ts`, `runtimeRobustness.test.ts`, and `network.test.ts`, alongside the original suites. Replica tests must close each state store or coordinator before constructing a new owner. Child-process tests verify kernel lock release and recovery after termination at every local journal stage. Packaging checks the PDF.js viewer, its rendering patch, and language configurations; if dependencies were installed with `--ignore-scripts`, run `npm run download-pdfjs` and `npm run download-latex-basics` first. A new local release also requires checking the packaged native prebuilds and testing the native merge UI in both supported VS Code versions.
 
 ### Documentation
 - [VSCode Extension API](https://code.visualstudio.com/api/references/vscode-api)
