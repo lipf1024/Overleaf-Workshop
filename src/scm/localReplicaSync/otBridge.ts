@@ -11,7 +11,7 @@ export class ReplicaOtBridge implements VSCode.Disposable {
     private bindings=new Map<string,{id:string;disk:string;session:OtSession;remote:TextOperation[];skipLocal:boolean}>();
     private listener:VSCode.Disposable;
     private changes:VSCode.Disposable;
-    constructor(private readonly root:VSCode.Uri,private readonly vfs:VirtualFileSystem,private readonly store:SyncStateStore,private readonly platform:typeof VSCode) {
+    constructor(private readonly root:VSCode.Uri,private readonly vfs:VirtualFileSystem,private readonly store:SyncStateStore,private readonly platform:typeof VSCode,private readonly isIgnored:(path:string)=>boolean=()=>false) {
         this.changes=vfs.onOtChange((id,op)=>{
             if (!op) { return; }
             for (const binding of this.bindings.values()) {
@@ -27,12 +27,13 @@ export class ReplicaOtBridge implements VSCode.Disposable {
         });
     }
     async establish(path:string,snapshot:RemoteSnapshot):Promise<void> {
+        if (this.isIgnored(path)) { return; }
         if (snapshot.revision.kind!=='document' || this.bindings.has(path)) { return; }
         await this.store.assertWritable();
         const session=await this.vfs.textSession(this.vfs.pathToUri('/'+path));
         if (!session?.ready || session.version!==snapshot.revision.documentVersion || contentHash(Buffer.from(session.confirmed))!==snapshot.hash) { return; }
         const disk=await this.store.access.read(path);
-        if (contentHash(disk)!==snapshot.hash) { return; }
+        if (this.isIgnored(path) || contentHash(disk)!==snapshot.hash) { return; }
         this.bindings.set(path,{id:snapshot.entityId,disk:Buffer.from(disk!).toString('utf8'),session,remote:[],skipLocal:false});
         const document=this.platform.workspace.textDocuments.find(doc=>doc.uri.toString()===this.platform.Uri.joinPath(this.root,path).toString());
         if (document) {
@@ -42,7 +43,7 @@ export class ReplicaOtBridge implements VSCode.Disposable {
     }
     async sync(path:string):Promise<{snapshot:RemoteSnapshot;local:Uint8Array}|undefined> {
         const binding=this.bindings.get(path);
-        if (!binding) { return; }
+        if (!binding || this.isIgnored(path)) { return; }
         await this.store.assertWritable();
         const remoteUri=this.vfs.pathToUri('/'+path);
         const session=await this.vfs.textSession(remoteUri);
@@ -67,6 +68,7 @@ export class ReplicaOtBridge implements VSCode.Disposable {
                 binding.disk=local; binding.skipLocal=true;
             });
         } else { await session.barrier(); }
+        if (this.bindings.get(path)!==binding || this.isIgnored(path)) { return; }
         const saved=Buffer.from(session.saved);
         const confirmed=Buffer.from(session.confirmed),hash=contentHash(confirmed)!;
         const snapshot:RemoteSnapshot={path:remoteUri.path,entityId:binding.id,kind:'text',content:confirmed,hash,
@@ -75,6 +77,7 @@ export class ReplicaOtBridge implements VSCode.Disposable {
         if (contentHash(await this.store.access.read(path))!==contentHash(bytes)) {
             throw new Error('File was saved again while OT was pending; newer disk content retained');
         }
+        if (this.bindings.get(path)!==binding || this.isIgnored(path)) { return; }
         if (contentHash(saved)!==contentHash(bytes)) {
             const journal=await this.store.atomicLocalWrite(path,saved,'download',undefined,contentHash(bytes),true);
             await this.store.removeJournal(journal.id);
@@ -82,8 +85,16 @@ export class ReplicaOtBridge implements VSCode.Disposable {
         binding.disk=saved.toString();
         binding.remote.splice(0,projectedEvents);
         const document=this.platform.workspace.textDocuments.find(doc=>doc.uri.toString()===this.platform.Uri.joinPath(this.root,path).toString());
-        if (document) { this.vfs.bindOtEditor(document,session); }
+        if (document && this.bindings.get(path)===binding && !this.isIgnored(path)) { this.vfs.bindOtEditor(document,session); }
         return {snapshot,local:saved};
+    }
+    excludeIgnored(isIgnored:(path:string)=>boolean):void {
+        for (const path of this.bindings.keys()) {
+            if (isIgnored(path)) {
+                this.vfs.unbindOtEditor(this.platform.Uri.joinPath(this.root,path));
+                this.bindings.delete(path);
+            }
+        }
     }
     dispose():void { this.listener.dispose(); this.changes.dispose(); this.bindings.clear(); }
 }

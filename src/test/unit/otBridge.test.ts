@@ -17,14 +17,38 @@ suite('Local disk OT integration',()=>{
         const sent:OtUpdate[]=[]; let changed:((id:string,op?:any)=>void)|undefined;
         const session=OtSession.fresh('doc',0,'ABC',{source:()=> 'self',send:async u=>{sent.push(u);},persist:async j=>store.writeOtJournal('a'.repeat(64),j),changed:(_s,_e,_r,op)=>changed?.('doc',op),log:()=>{}});
         const snapshot=():RemoteSnapshot=>{const content=Buffer.from(session.confirmed),hash=contentHash(content)!;return {entityId:'doc',kind:'text',path:'main.tex',content,hash,revision:{kind:'document',documentVersion:session.version,contentHash:hash},connectionEpoch:1};};
+        const detached:string[]=[];
         const uri={toString:()=>root};
         const platform:any={workspace:{textDocuments:[],onDidOpenTextDocument:()=>({dispose:()=>{}})},Uri:{joinPath:(_:any,part:string)=>({toString:()=>path.join(root,part)})}};
-        const bridge=new ReplicaOtBridge(uri as any,{connectionEpoch:1,onOtChange:(fn:any)=>{changed=fn;return {dispose:()=>{}};},textSession:async()=>session,pathToUri:()=>uri,confirmedTextSnapshot:async()=>snapshot(),bindOtEditor:()=>{}} as any,store,platform);
+        const bridge=new ReplicaOtBridge(uri as any,{connectionEpoch:1,onOtChange:(fn:any)=>{changed=fn;return {dispose:()=>{}};},textSession:async()=>session,pathToUri:()=>uri,confirmedTextSnapshot:async()=>snapshot(),bindOtEditor:()=>{},unbindOtEditor:(uri:any)=>detached.push(uri.toString())} as any,store,platform);
         await bridge.establish('main.tex',snapshot());
         const waitSend=async(count:number)=>{for(let n=0;n<200&&sent.length<count;n++){await new Promise(resolve=>setTimeout(resolve,5));}assert.strictEqual(sent.length,count);};
         const ack=()=>session.receive({doc:'doc',v:session.version,op:session.snapshot().inflight!.op,meta:{source:'self'}});
-        return {root,file,store,session,bridge,sent,waitSend,ack,close:async()=>{bridge.dispose();session.dispose();await store.close();await fs.rm(root,{recursive:true,force:true});}};
+        return {root,file,store,session,bridge,sent,detached,waitSend,ack,close:async()=>{bridge.dispose();session.dispose();await store.close();await fs.rm(root,{recursive:true,force:true});}};
     }
+    test('ignoring a bound file detaches its editor and stops subsequent disk uploads',async()=>{
+        const f=await fixture();
+        try {
+            f.bridge.excludeIgnored(name=>name==='main.tex');
+            assert.deepStrictEqual(f.detached,[f.file]);
+            await fs.writeFile(f.file,'local private edit');
+            assert.strictEqual(await f.bridge.sync('main.tex'),undefined);
+            assert.strictEqual(f.sent.length,0);
+            assert.strictEqual(await fs.readFile(f.file,'utf8'),'local private edit');
+        } finally { await f.close(); }
+    });
+    test('ignoring during an outstanding ACK does not later overwrite disk or restore the binding',async()=>{
+        const f=await fixture();
+        try {
+            await fs.writeFile(f.file,'ABCD');
+            const syncing=f.bridge.sync('main.tex'); await f.waitSend(1);
+            f.bridge.excludeIgnored(()=>true);
+            await fs.writeFile(f.file,'private newer content');
+            await f.ack(); await syncing;
+            assert.strictEqual(await fs.readFile(f.file,'utf8'),'private newer content');
+            assert.strictEqual(await f.bridge.sync('main.tex'),undefined);
+        } finally { await f.close(); }
+    });
     test('saved local delta and a remote insertion converge without snapshot reads',async()=>{
         const f=await fixture();
         try {

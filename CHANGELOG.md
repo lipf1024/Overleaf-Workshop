@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.16.26
+
+- Align Explorer ignore actions with existing Local Replica menu naming: Exclude from Sync and Edit Sync Ignore Rules. Update translations and usage instructions.
+
+## 0.16.25
+
+- Dim ignored Local Replica files and folders in Explorer, including files that have never been synchronized. Show a pause badge for ignored files with a previous synchronization baseline, with a tooltip explaining that copies may differ.
+- Do not propagate ignored colors to parent folders. Refresh decorations when ignore rules change, and add an Explorer action to open `.overleafignore` for the selected replica.
+
+## 0.16.24
+
+- Store Local Replica sync exclusions in `.overleafignore`, initialize defaults or migrate existing rules, and reload saved changes. Add a multi-selection Explorer Ignore Sync action and a command to edit the file. Keep the file out of Overleaf synchronization.
+- Add Incoming and Outgoing group actions for scoped downloads and uploads, preserving dirty files, conflict checks, and synchronization direction.
+- Detach ignored local text files from online editor bindings and preserve newer disk content when outstanding acknowledgements arrive.
+- Document gitignore syntax and legacy glob migration limitations. Automated tests pass; live VS Code/Overleaf UI validation remains outstanding.
+
 ## 0.16.23
 
 - Classify directory events before file synchronization, preventing folders from appearing as failed binary uploads in Outgoing. Reconcile descendant files after remote folder events.

@@ -196,6 +196,15 @@ export class SyncCoordinator {
         if (!this.isOwner) { return Promise.reject(new Error('Synchronization is owned by another window')); }
         return this.enqueue(path,()=>this.reconcilePath(path,'manual','safeAuto',false));
     }
+    syncGroupPath(path:string,direction:'incoming'|'outgoing'):Promise<void> {
+        if (!this.isOwner) { return Promise.reject(new Error('Synchronization is owned by another window')); }
+        return this.enqueue(path,async()=>{
+            const record=this.find(path);
+            const statuses=direction==='incoming'?['pending-download','remote-changed']:['pending-upload','local-changed','error'];
+            if (!record || record.suspension || record.pendingConflictId || this.adapter.isLocalDirty(path) || !statuses.includes(record.status)) { return; }
+            await this.reconcilePath(path,'manual','safeAuto',false,direction);
+        });
+    }
     syncNow():Promise<void> {
         if (this.manualSync) { return this.manualSync; }
         const task=this.runManualSync().finally(()=>{
@@ -521,7 +530,7 @@ export class SyncCoordinator {
         this.state.files[record.key]=record; await this.persist(); return false;
     }
 
-    private async reconcilePath(rawPath:string,cause:'bootstrap'|'local'|'remote'|'manual',modeOverride?:SyncMode,allowRename=true):Promise<void> {
+    private async reconcilePath(rawPath:string,cause:'bootstrap'|'local'|'remote'|'manual',modeOverride?:SyncMode,allowRename=true,direction?:'incoming'|'outgoing'):Promise<void> {
         const path=normalizePath(rawPath);
         this.compileConfirmations.delete(pathComparisonKey(path));
         if (!await this.allowPath(path)) { return; }
@@ -529,7 +538,7 @@ export class SyncCoordinator {
         if (recovery) { await this.setFrozen(path,recovery); return; }
         if (this.blockedRecovery.has(pathComparisonKey(path))) { await this.setError(path,'Interrupted binary replacement is unresolved; retry recovery before synchronizing this path'); return; }
         if (path==='.overleaf' || path.startsWith('.overleaf/')) { return; }
-        if (cause!=='bootstrap' && await this.syncOnlineText(path)) { return; }
+        if (!direction && cause!=='bootstrap' && await this.syncOnlineText(path)) { return; }
         const pathIssue=validateReplicaPath(path);
         if (pathIssue) { await this.setFrozen(path,pathIssue); return; }
         try { this.store.resolveSafe(path); } catch (error:any) { await this.setFrozen(path,error?.message??String(error)); return; }
@@ -550,6 +559,7 @@ export class SyncCoordinator {
         if (record?.entityId && !remote && this.adapter.locateRemotePath) {
             const movedTo=await this.adapter.locateRemotePath(record.entityId);
             if (movedTo && pathComparisonKey(movedTo)!==pathComparisonKey(path)) {
+                if (direction) { await this.setError(path,'Remote path moved; review the move before synchronizing'); return; }
                 await this.handleRemoteMove(record,movedTo,cause); return;
             }
         }
@@ -576,6 +586,15 @@ export class SyncCoordinator {
             return;
         }
         const decision=reconcile({base,local,remote:remote?.content,kind,mode:modeOverride??this.mode,cause});
+        if (direction && decision.action==='merge') {
+            await this.freezeConflict(record,base,local,remote,'Both sides changed; review before group synchronization',[],decision.merged); return;
+        }
+        if (direction==='incoming' && ['upload','delete-remote'].includes(decision.action)
+            || direction==='outgoing' && ['download','delete-local'].includes(decision.action)) {
+            record.status=direction==='incoming'?'pending-upload':'pending-download';
+            record.message='The synchronization direction changed; review the other group';
+            await this.persist(); return;
+        }
         record.observed={localHash:local&&contentHash(local),remoteHash:remote?.hash};
         record.entityId=remote?.entityId??record.entityId;
         record.kind=kind;
@@ -665,6 +684,7 @@ export class SyncCoordinator {
         const latest=unwrapRemoteRead(latestResult);
         if (!latest) { await this.freezeConflict(record,base,currentLocal,undefined,'Overleaf deleted the file before download',[]); return; }
         if (contentHash(currentLocal)!==expectedLocalHash) { await this.freezeConflict(record,base,currentLocal,latest,'Local file changed before download',[]); return; }
+        if (!await this.allowPath(record.path)) { return; }
         const operationId=this.suppressor.register('local',record.path,latest.hash);
         const entry=await this.store.atomicLocalWrite(record.path,latest.content,'download',operationId,expectedLocalHash,true);
         const verify=await this.adapter.readLocal(record.path);

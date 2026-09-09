@@ -1,10 +1,10 @@
 import * as vscode from 'vscode';
 import { FileSyncRecord } from './model';
-import { syncDecoration } from './syncDecoration';
+import { ignoredDecoration, syncDecoration } from './syncDecoration';
 import { ConflictNotificationTracker, hasUnresolvedConflict } from './conflictState';
 
 export class ConflictPresentation implements vscode.FileDecorationProvider, vscode.Disposable {
-    private readonly changed=new vscode.EventEmitter<vscode.Uri[]>();
+    private readonly changed=new vscode.EventEmitter<vscode.Uri[]|undefined>();
     readonly onDidChangeFileDecorations=this.changed.event;
     private readonly registration=vscode.window.registerFileDecorationProvider(this);
     private readonly status=vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left,100);
@@ -14,7 +14,7 @@ export class ConflictPresentation implements vscode.FileDecorationProvider, vsco
     private notificationTimer?:ReturnType<typeof setTimeout>;
     private disposed=false;
 
-    constructor(private readonly root:vscode.Uri,private readonly openConflict:(id?:string)=>Promise<void>) {
+    constructor(private readonly root:vscode.Uri,private readonly openConflict:(id?:string)=>Promise<void>,private readonly isIgnored?:(uri:vscode.Uri)=>Promise<boolean>) {
         this.status.name='Overleaf conflicts';
         this.status.command='overleaf-workshop.localReplica.reviewPending';
         this.status.backgroundColor=new vscode.ThemeColor('statusBarItem.errorBackground');
@@ -30,7 +30,7 @@ export class ConflictPresentation implements vscode.FileDecorationProvider, vsco
             const decoration=syncDecoration(record);
             if (decoration) {
                 this.decorations.set(vscode.Uri.joinPath(this.root,record.path).toString(),{
-                    badge:decoration.badge,color:new vscode.ThemeColor(decoration.color),tooltip:decoration.tooltip,propagate:true,
+                    badge:decoration.badge,color:new vscode.ThemeColor(decoration.color),tooltip:decoration.tooltip,propagate:record.suspension!=='ignored',
                 });
             }
         }
@@ -51,8 +51,16 @@ export class ConflictPresentation implements vscode.FileDecorationProvider, vsco
         }
     }
 
-    provideFileDecoration(uri:vscode.Uri):vscode.FileDecoration|undefined {
-        return this.decorations.get(uri.toString());
+    refreshIgnored():void { this.changed.fire(undefined); }
+
+    provideFileDecoration(uri:vscode.Uri):vscode.ProviderResult<vscode.FileDecoration> {
+        const known=this.decorations.get(uri.toString());
+        if (known || !this.isIgnored) { return known; }
+        return this.isIgnored(uri).then(ignored=>{
+            if (!ignored || this.disposed) { return; }
+            const decoration=ignoredDecoration();
+            return {color:new vscode.ThemeColor(decoration.color),tooltip:decoration.tooltip,propagate:false};
+        });
     }
 
     private async notify():Promise<void> {

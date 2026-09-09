@@ -100,8 +100,8 @@ suite('Native Overleaf conflict editor',function(){
         try {
             presentation.update(coordinator.records(),false);
             const working=vscode.Uri.file(path.join(root,'main.tex'));
-            assert.strictEqual(presentation.provideFileDecoration(working)?.badge,'!');
-            assert.strictEqual(presentation.provideFileDecoration(working)?.color?.id,'gitDecoration.conflictingResourceForeground');
+            assert.strictEqual((await presentation.provideFileDecoration(working))?.badge,'!');
+            assert.strictEqual((await presentation.provideFileDecoration(working))?.color?.id,'gitDecoration.conflictingResourceForeground');
             const {input,document}=await openEditor();
             assert.strictEqual(input.input1.scheme,CONFLICT_SNAPSHOT_SCHEME);
             assert.strictEqual(text(await vscode.workspace.fs.readFile(input.input1)),'local\n');
@@ -122,7 +122,7 @@ suite('Native Overleaf conflict editor',function(){
             assert.strictEqual(adapter.writes,1);
             assert.strictEqual(coordinator.records()[0].status,'clean');
             assert.strictEqual(await coordinator.getConflict(id),undefined);
-            assert.strictEqual(presentation.provideFileDecoration(working),undefined);
+            assert.strictEqual(await presentation.provideFileDecoration(working),undefined);
         } finally { stop(); presentation.dispose(); }
     });
 

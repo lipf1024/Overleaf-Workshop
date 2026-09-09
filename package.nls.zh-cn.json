@@ -11,5 +11,9 @@
   "configuration.localReplica.syncMode.markdownDescription": "选择此本地副本的同步方式。自动同步：开会自动应用稳定且无冲突的更改；关闭自动同步后只记录更改，直到运行“本地副本：立即同步”。",
   "configuration.localReplica.syncMode.safeAuto.label": "自动同步：开",
   "configuration.localReplica.syncMode.manual.label": "自动同步：关",
-  "configuration.localReplica.enableCompileNPreview.markdownDescription": "为此本地副本启用 Overleaf 编译和 PDF 预览。修改后立即生效。这里显式设置的值优先于 `.overleaf/settings.json` 中旧的 `enableCompileNPreview` 值。"
+  "configuration.localReplica.enableCompileNPreview.markdownDescription": "为此本地副本启用 Overleaf 编译和 PDF 预览。修改后立即生效。这里显式设置的值优先于 `.overleaf/settings.json` 中旧的 `enableCompileNPreview` 值。",
+  "commands.localReplica.openIgnoreFile.title": "Local Replica: 编辑同步忽略规则",
+  "commands.localReplica.ignoreSync.title": "Local Replica: 排除同步",
+  "commands.localReplica.pullIncoming.title": "拉取全部传入文件",
+  "commands.localReplica.pushOutgoing.title": "上传全部传出文件"
 }

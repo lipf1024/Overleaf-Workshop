@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { DEFAULT_IGNORE_PATTERNS, IGNORE_FILE, IgnoreFile, literalIgnorePattern } from './localReplicaSync/ignoreFile';
 import { SyncProgress } from './syncProgress';
 import { createHash } from 'crypto';
 import * as path from 'path';
@@ -35,7 +36,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private paused?:vscode.SourceControlResourceGroup;
     private static readonly closing=new Set<Promise<void>>();
     private get policy():PathPolicy {
-        return this.pathPolicy??=new PathPolicy(this.store?.access??new LocalPathAccess(this.baseUri.fsPath),()=>this.getSetting<string[]>(IGNORE_SETTING_KEY)||this.ignorePatterns);
+        return this.pathPolicy??=new PathPolicy(this.store?.access??new LocalPathAccess(this.baseUri.fsPath),()=>[],value=>this.ignoreFile?.isIgnored(value)??true);
     }
     private shutdown():Promise<void> {
         if (!this.stopping) {
@@ -62,29 +63,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private scanIssues:PathIssue[]=[];
     private initializingSync=true;
     private lastCompileNotice?:string;
-    private ignorePatterns: string[] = [
-        '**/.*',
-        '**/.*/**',
-        '**/*.aux',
-        '**/__latexindent*',
-        '**/*.bbl',
-        '**/*.bcf',
-        '**/*.blg',
-        '**/*.fdb_latexmk',
-        '**/*.fls',
-        '**/*.git',
-        '**/*.lof',
-        '**/*.log',
-        '**/*.lot',
-        '**/*.out',
-        '**/*.run.xml',
-        '**/*.synctex(busy)',
-        '**/*.synctex.gz',
-        '**/*.toc',
-        '**/*.xdv',
-        '**/main.pdf',
-        '**/output.pdf',
-    ];
+    private ignoreFile?:IgnoreFile;
+    private reloadIgnore?:()=>Promise<void>;
+    private ignoreUpdates:Promise<void>=Promise.resolve();
+    private groupSyncing=new Set<string>();
 
     constructor(
         protected readonly vfs: VirtualFileSystem,
@@ -159,6 +141,27 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             };
             this.commandDisposables=[
                 ConflictManager.acquireResources(),
+                vscode.commands.registerCommand('overleaf-workshop.localReplica.openIgnoreFile',(uri?:vscode.Uri)=>{
+                    const provider=uri?.scheme==='file'?[...this.instances].filter(item=>uri.fsPath===item.baseUri.fsPath || uri.fsPath.startsWith(item.baseUri.fsPath+path.sep))
+                        .sort((a,b)=>b.baseUri.fsPath.length-a.baseUri.fsPath.length)[0]:this.activeProvider();
+                    return provider?.openIgnoreFile();
+                }),
+                vscode.commands.registerCommand('overleaf-workshop.localReplica.ignoreSync',async(uri?:vscode.Uri,selected?:vscode.Uri[])=>{
+                    const uris=selected?.length?selected:uri?[uri]:[];
+                    const grouped=new Map<LocalReplicaSCMProvider,vscode.Uri[]>();
+                    for (const target of uris) {
+                        const provider=[...this.instances].filter(item=>target.scheme==='file' && target.fsPath.startsWith(item.baseUri.fsPath+path.sep))
+                            .sort((a,b)=>b.baseUri.fsPath.length-a.baseUri.fsPath.length)[0];
+                        if (!provider || path.relative(provider.baseUri.fsPath,target.fsPath)===IGNORE_FILE) { continue; }
+                        grouped.set(provider,[...(grouped.get(provider)??[]),target]);
+                    }
+                    try { for (const [provider,items] of grouped) { await provider.ignoreSelections(items); } }
+                    catch (error:any) { void vscode.window.showWarningMessage(`Unable to ignore selection: ${error.message}`); }
+                }),
+                ...['pullIncoming','pushOutgoing'].map(command=>vscode.commands.registerCommand(`overleaf-workshop.localReplica.${command}`,(group:vscode.SourceControlResourceGroup)=>{
+                    const provider=[...this.instances].find(item=>command==='pullIncoming'?item.incoming===group:item.outgoing===group);
+                    return provider?.syncGroup(group);
+                })),
                 vscode.commands.registerCommand('overleaf-workshop.localReplica.syncFile',async(target?:vscode.Uri|vscode.SourceControlResourceState)=>{
                     const uri=target instanceof vscode.Uri?target:target?.resourceUri??vscode.window.activeTextEditor?.document.uri;
                     if (!uri || uri.scheme!=='file') { return; }
@@ -314,6 +317,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             disposed=true;
             ownerResources.forEach(item=>item.dispose()); resources.forEach(item=>item.dispose());
             await observerTask;
+            await this.ignoreUpdates;
             await Promise.all(ownerResources.map(item=>item.whenIdle()));
             try { await this.conflictManager?.shutdown(); }
             finally {
@@ -337,9 +341,25 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     projectId:this.vfs.projectId,serverIdentityHash,syncEngineVersion:1};
                 await store.saveProjectSettings(settings);
             }
+            this.ignoreFile=new IgnoreFile(store.access);
+            await this.ignoreFile.initialize(this.getSetting<string[]>(IGNORE_SETTING_KEY)??DEFAULT_IGNORE_PATTERNS,store.isOwner);
             const configured=vscode.workspace.getConfiguration('overleaf-workshop.localReplica',this.baseUri).get<SyncMode>('syncMode','safeAuto');
-            const textBridge=new ReplicaOtBridge(this.baseUri,this.vfs,store,vscode);
+            const textBridge=new ReplicaOtBridge(this.baseUri,this.vfs,store,vscode,value=>this.policy.isIgnored(value));
             resources.push(textBridge);
+            const ignoreWatcher=vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(this.baseUri,IGNORE_FILE));
+            const refreshIgnore=this.reloadIgnore=()=>{
+                this.ignoreUpdates=this.ignoreUpdates.catch(()=>undefined).then(async()=>{
+                    if (disposed) { return; }
+                    await this.ignoreFile!.reload();
+                    textBridge.excludeIgnored(value=>this.policy.isIgnored(value));
+                    if (this.coordinator?.isOwner) { await this.coordinator.scan('bootstrap','manual'); }
+                    this.conflictPresentation?.refreshIgnored();
+                }).catch(error=>{ report(error); void vscode.window.showWarningMessage(`Unable to reload .overleafignore: ${error.message}`); });
+                return this.ignoreUpdates;
+            };
+            resources.push(ignoreWatcher,ignoreWatcher.onDidCreate(refreshIgnore),ignoreWatcher.onDidChange(refreshIgnore),ignoreWatcher.onDidDelete(()=>{
+                void vscode.window.showWarningMessage('.overleafignore was removed. Previous rules remain active until the file is recreated.');
+            }));
         const adapter:SyncAdapter={
             establishText:(path,snapshot)=>textBridge.establish(path,snapshot),
             syncText:path=>textBridge.sync(path),
@@ -384,7 +404,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             const initialized=await this.coordinator.initialize();
             this.output=vscode.window.createOutputChannel(`Overleaf Local Replica: ${this.vfs.projectName}`);
             this.createSourceControl();
-            this.conflictPresentation=new ConflictPresentation(this.baseUri,id=>this.openConflict(id));
+            this.conflictPresentation=new ConflictPresentation(this.baseUri,id=>this.openConflict(id),async uri=>{
+                if (uri.scheme!=='file' || !uri.fsPath.startsWith(this.baseUri.fsPath+path.sep)) { return false; }
+                const relative=path.relative(this.baseUri.fsPath,uri.fsPath).split(path.sep).join('/');
+                if (this.policy.isIgnored(relative)) { return true; }
+                // Only stat paths that could match a directory-only rule; never scan descendants.
+                if (!this.policy.isIgnored(relative+'/')) { return false; }
+                try { return (await vscode.workspace.fs.stat(uri)).type===vscode.FileType.Directory && this.policy.isIgnored(relative+'/'); }
+                catch { return false; }
+            });
             const stopSourceControl=this.coordinator.onDidChange(records=>this.updateSourceControl(records));
             resources.push(this.output,this.sourceControl!,this.conflictPresentation,LocalReplicaSCMProvider.acquireCommands(),new vscode.Disposable(stopSourceControl));
             LocalReplicaSCMProvider.instances.add(this);
@@ -512,6 +540,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.outgoing!.resourceStates=records.filter(r=>!r.suspension && !hasUnresolvedConflict(r) && (r.status==='pending-upload'||r.status==='local-changed'||r.status==='error')).map(item);
         this.conflicts!.resourceStates=records.filter(r=>!r.suspension && hasUnresolvedConflict(r)).map(item);
         this.paused!.resourceStates=records.filter(r=>r.suspension && r.suspension!=='ignored').map(item);
+        for (const group of [this.incoming!,this.outgoing!]) {
+            group.contextValue=this.groupSyncing.has(group.id)?'overleafGroupBusy':this.coordinator?.isOwner&&group.resourceStates.length?`overleafGroup_${group.id}`:undefined;
+        }
         this.conflictPresentation?.update(records,!this.initializingSync && !!this.coordinator?.isOwner);
         for (const record of records.filter(item=>item.status==='error' && item.message)) {
             if (this.loggedErrors.get(record.path)===record.message) { continue; }
@@ -630,50 +661,52 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return inputBox;
     }
 
+    private async openIgnoreFile():Promise<void> {
+        const access=this.store?.access??new LocalPathAccess(this.baseUri.fsPath);
+        if (!await access.read(IGNORE_FILE)) {
+            if (this.store) { await this.store.assertWritable(); }
+            this.ignoreFile??=new IgnoreFile(access);
+            await this.ignoreFile.initialize(this.getSetting<string[]>(IGNORE_SETTING_KEY)??DEFAULT_IGNORE_PATTERNS,true);
+        }
+        await vscode.window.showTextDocument(vscode.Uri.joinPath(this.baseUri,IGNORE_FILE));
+    }
+
+    private async ignoreSelections(uris:vscode.Uri[]):Promise<void> {
+        await this.openIgnoreFile();
+        const uri=vscode.Uri.joinPath(this.baseUri,IGNORE_FILE);
+        const document=await vscode.workspace.openTextDocument(uri);
+        const patterns=[...new Set(uris.map(uri=>literalIgnorePattern(path.relative(this.baseUri.fsPath,uri.fsPath).split(path.sep).join('/'))))];
+        const existing=document.getText();
+        // Append after any exceptions: an earlier identical rule may have been negated later.
+        const lastRule=existing.trimEnd().split(/\r?\n/).pop();
+        const additions=patterns.filter(pattern=>pattern!==lastRule);
+        if (!additions.length) { return; }
+        const edit=new vscode.WorkspaceEdit();
+        edit.insert(uri,document.positionAt(existing.length),(existing.endsWith('\n')?'':'\n')+additions.join('\n')+'\n');
+        if (!await vscode.workspace.applyEdit(edit) || !await document.save()) { throw new Error('Unable to save ignore rules'); }
+        await this.reloadIgnore?.();
+    }
+
+    private async syncGroup(group:vscode.SourceControlResourceGroup):Promise<void> {
+        if (!this.coordinator?.isOwner || this.groupSyncing.has(group.id)) { return; }
+        const paths=group.resourceStates.map(item=>path.relative(this.baseUri.fsPath,item.resourceUri.fsPath).split(path.sep).join('/'));
+        if (!paths.length) { return; }
+        this.groupSyncing.add(group.id); this.updateSourceControl(this.coordinator.records());
+        try {
+            await vscode.window.withProgress({location:vscode.ProgressLocation.SourceControl,title:group===this.incoming?'Pulling incoming files':'Uploading outgoing files'},async progress=>{
+                for (const relative of paths) {
+                    progress.report({message:relative,increment:100/paths.length});
+                    await this.coordinator!.syncGroupPath(relative,group===this.incoming?'incoming':'outgoing');
+                }
+            });
+            const remaining=this.coordinator.records().filter(record=>paths.includes(record.path)&&record.status!=='clean');
+            if (remaining.length) { void vscode.window.showWarningMessage(`${remaining.length} file(s) still need attention. Review Source Control.`); }
+        } catch (error:any) { void vscode.window.showWarningMessage(`Group synchronization stopped: ${error.message}`); }
+        finally { this.groupSyncing.delete(group.id); this.updateSourceControl(this.coordinator.records()); }
+    }
+
     get settingItems(): SettingItem[] {
-        return [
-            // configure ignore patterns
-            {
-                label: vscode.l10n.t('Configure sync ignore patterns ...'),
-                callback: async () => {
-                    const ignorePatterns = (this.getSetting<string[]>(IGNORE_SETTING_KEY) || this.ignorePatterns).sort();
-                    const quickPick = vscode.window.createQuickPick();
-                    quickPick.ignoreFocusOut = true;
-                    quickPick.title = vscode.l10n.t('Press Enter to add a new pattern, or click the trash icon to remove a pattern.');
-                    quickPick.items = ignorePatterns.map(pattern => ({
-                        label: pattern,
-                        buttons: [{iconPath: new vscode.ThemeIcon('trash')}],
-                    }));
-                    // remove pattern when click the trash icon
-                    quickPick.onDidTriggerItemButton(async ({item}) => {
-                        const index = ignorePatterns.indexOf(item.label);
-                        ignorePatterns.splice(index, 1);
-                        await this.setSetting(IGNORE_SETTING_KEY, ignorePatterns);
-                        quickPick.items = ignorePatterns.map(pattern => ({
-                            label: pattern,
-                            buttons: [{iconPath: new vscode.ThemeIcon('trash')}],
-                        }));
-                    });
-                    // add new pattern when not exist
-                    quickPick.onDidAccept(async () => {
-                        if (quickPick.selectedItems.length===0) {
-                            const pattern = quickPick.value;
-                            if (pattern!=='') {
-                                ignorePatterns.push(pattern);
-                                await this.setSetting(IGNORE_SETTING_KEY, ignorePatterns);
-                                quickPick.items = ignorePatterns.map(pattern => ({
-                                    label: pattern,
-                                    buttons: [{iconPath: new vscode.ThemeIcon('trash')}],
-                                }));
-                                quickPick.value = '';
-                            }
-                        }
-                    });
-                    // show the quick pick
-                    quickPick.show();
-                },
-            },
-        ];
+        return [{label:vscode.l10n.t('Edit Sync Ignore Rules'),callback:()=>this.openIgnoreFile()}];
     }
 
     list(): Iterable<CommitItem> { return []; }

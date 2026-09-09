@@ -116,10 +116,11 @@ export class LocalPathAccess {
 /** Policy applies to existing records as well as new scanner/watcher paths. */
 export class PathPolicy {
     private issues:PathIssue[]=[];
-    constructor(readonly access:LocalPathAccess,private readonly patterns:()=>string[]) {}
+    constructor(readonly access:LocalPathAccess,private readonly patterns:()=>string[],private readonly matcher?:(value:string)=>boolean) {}
     setIssues(issues:PathIssue[]):void { this.issues=issues; }
     isIgnored(value:string):boolean {
-        if (isInternalReplicaPath(value)) { return true; }
+        if (value==='.overleafignore' || isInternalReplicaPath(value)) { return true; }
+        if (this.matcher) { return this.matcher(value); }
         const parts=value.replace(/\\/g,'/').replace(/^\/+|\/+$/g,'').split('/');
         return this.patterns().some(pattern=>parts.some((_,index)=>minimatch(parts.slice(0,index+1).join('/'),pattern,{dot:true})));
     }

@@ -751,6 +751,9 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
         return this.otDocuments;
     }
+    unbindOtEditor(uri:vscode.Uri):void {
+        const key=uri.toString(); this.otEditors.get(key)?.dispose(); this.otEditors.delete(key);
+    }
     bindOtEditor(document:vscode.TextDocument,session:OtSession):void {
         const key=document.uri.toString();
         if (this.otEditors.get(key)?.session!==session) { this.otEditors.get(key)?.dispose(); this.otEditors.delete(key); }

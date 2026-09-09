@@ -13,5 +13,6 @@
   "Review preserved local versions": "检查保留的本地版本",
   "Preserved original ↔ Current local file": "保留的原文件 ↔ 当前本地文件",
   "Keep Current File and Resume": "保留当前文件并恢复同步",
-  "Review {0}. Resuming keeps the current local file and backs up the preserved versions. Overleaf changes will be checked again before synchronization.": "请检查 {0}。恢复同步会保留当前本地文件，并备份已保留的版本。同步前会再次校验 Overleaf 的变化。"
+  "Review {0}. Resuming keeps the current local file and backs up the preserved versions. Overleaf changes will be checked again before synchronization.": "请检查 {0}。恢复同步会保留当前本地文件，并备份已保留的版本。同步前会再次校验 Overleaf 的变化。",
+  "Edit Sync Ignore Rules": "编辑同步忽略规则"
 }

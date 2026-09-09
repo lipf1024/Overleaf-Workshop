@@ -2,7 +2,7 @@
   "name": "overleaf-workshop",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.16.23",
+  "version": "0.16.26",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "lipf",
@@ -478,6 +478,30 @@
         "command": "overleaf-workshop.localReplica.reviewRecovery",
         "title": "%commands.localReplica.reviewRecovery.title%",
         "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.localReplica.openIgnoreFile",
+        "title": "%commands.localReplica.openIgnoreFile.title%",
+        "category": "Overleaf Workshop",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "overleaf-workshop.localReplica.ignoreSync",
+        "title": "%commands.localReplica.ignoreSync.title%",
+        "category": "Overleaf Workshop",
+        "icon": "$(exclude)"
+      },
+      {
+        "command": "overleaf-workshop.localReplica.pullIncoming",
+        "title": "%commands.localReplica.pullIncoming.title%",
+        "category": "Overleaf Workshop",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "overleaf-workshop.localReplica.pushOutgoing",
+        "title": "%commands.localReplica.pushOutgoing.title%",
+        "category": "Overleaf Workshop",
+        "icon": "$(cloud-upload)"
       }
     ],
     "keybindings": [
@@ -669,6 +693,22 @@
         {
           "command": "overleaf-workshop.localReplica.markResolvedInEditor",
           "when": "false"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.openIgnoreFile",
+          "when": "overleaf-workshop.localReplicaWorkspace"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.ignoreSync",
+          "when": "false"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.pullIncoming",
+          "when": "false"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.pushOutgoing",
+          "when": "false"
         }
       ],
       "scm/resourceState/context": [
@@ -726,6 +766,16 @@
         {
           "command": "overleaf-workshop.remoteFileSystem.createLinkedFile",
           "when": "resourceScheme == overleaf-workshop && explorerResourceIsFolder"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.ignoreSync",
+          "when": "overleaf-workshop.localReplicaWorkspace && resourceScheme == file && resourceFilename != .overleafignore",
+          "group": "overleaf@3"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.openIgnoreFile",
+          "when": "overleaf-workshop.localReplicaWorkspace && resourceScheme == file",
+          "group": "overleaf@4"
         }
       ],
       "editor/context": [
@@ -928,6 +978,18 @@
           "when": "isMergeResultEditor && mergeEditorBaseUri =~ /^overleaf-workshop-conflict:/",
           "group": "navigation@1"
         }
+      ],
+      "scm/resourceGroup/context": [
+        {
+          "command": "overleaf-workshop.localReplica.pullIncoming",
+          "when": "scmProvider == overleafLocalReplica && scmResourceGroupState == overleafGroup_incoming",
+          "group": "inline"
+        },
+        {
+          "command": "overleaf-workshop.localReplica.pushOutgoing",
+          "when": "scmProvider == overleafLocalReplica && scmResourceGroupState == overleafGroup_outgoing",
+          "group": "inline"
+        }
       ]
     },
     "customEditors": [
@@ -968,6 +1030,7 @@
     "diff-match-patch": "^1.0.5",
     "fs-native-extensions": "1.5.1",
     "fuzzysearch": "^1.0.3",
+    "ignore": "7.0.5",
     "mime-types": "^2.1.35",
     "minimatch": "^9.0.9",
     "prettier": "^3.1.1",

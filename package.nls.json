@@ -70,5 +70,9 @@
   "views.explorer.overleaf-workshop.chatWebview.contextualTitle": "Overleaf Chat",
   "customEditors.overleaf-workshop.pdfViewer.displayName": "Overleaf Workshop PDF Viewer",
   "commands.localReplica.reviewRecovery.title": "Local Replica: Review Recovery Files",
-  "commands.remoteFileSystem.retryConnection.title": "Overleaf: Retry Connection"
+  "commands.remoteFileSystem.retryConnection.title": "Overleaf: Retry Connection",
+  "commands.localReplica.openIgnoreFile.title": "Local Replica: Edit Sync Ignore Rules",
+  "commands.localReplica.ignoreSync.title": "Local Replica: Exclude from Sync",
+  "commands.localReplica.pullIncoming.title": "Pull All Incoming",
+  "commands.localReplica.pushOutgoing.title": "Upload All Outgoing"
 }

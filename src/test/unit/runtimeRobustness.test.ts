@@ -246,9 +246,31 @@ suite('0.16.7 remote and runtime regressions',()=>{
             record.suspension='blocked'; presentation.update([record],false);
             assert.strictEqual(presentation.provideFileDecoration(file).badge,'P');
             record.suspension='ignored'; presentation.update([record],false);
-            assert.strictEqual(presentation.provideFileDecoration(file),undefined);
+            assert.strictEqual(presentation.provideFileDecoration(file).badge,'Ⅱ');
+            assert.strictEqual(presentation.provideFileDecoration(file).color.id,'gitDecoration.ignoredResourceForeground');
+            assert.strictEqual(presentation.provideFileDecoration(file).propagate,false);
+            record.base=undefined; presentation.update([record],false);
+            assert.strictEqual(presentation.provideFileDecoration(file).badge,undefined);
             record.suspension=undefined; record.status='clean'; presentation.update([record],false);
             assert.strictEqual(presentation.provideFileDecoration(file),undefined);
+        } finally { presentation.dispose(); }
+    });
+
+    test('untracked ignored paths are gray without propagating to parents and refresh after rule changes',async()=>{
+        const r=runtime();
+        r.vscode.window.registerFileDecorationProvider=()=>new Disposable();
+        const {ConflictPresentation}=isolatedModule('scm/localReplicaSync/conflictPresentation',{vscode:r.vscode});
+        let ignored=true;
+        const presentation=new ConflictPresentation(Uri.file('/replica'),async()=>{},async(uri:any)=>ignored&&uri.fsPath.startsWith('/replica/private'));
+        try {
+            const file=Uri.file('/replica/private/a.tex');
+            const decoration=await presentation.provideFileDecoration(file);
+            assert.strictEqual(decoration.color.id,'gitDecoration.ignoredResourceForeground');
+            assert.strictEqual(decoration.badge,undefined);
+            assert.strictEqual(decoration.propagate,false);
+            assert.strictEqual(await presentation.provideFileDecoration(Uri.file('/replica')),undefined);
+            ignored=false; presentation.refreshIgnored();
+            assert.strictEqual(await presentation.provideFileDecoration(file),undefined);
         } finally { presentation.dispose(); }
     });
 

@@ -75,6 +75,36 @@ suite('SyncCoordinator fault safety',()=>{
     });
     teardown(async()=>{ await store.close(); await fs.rm(root,{recursive:true,force:true}); });
 
+    test('group synchronization uploads only selected outgoing paths and skips incoming files',async()=>{
+        const coordinator=new SyncCoordinator(store,adapter,'manual'); await coordinator.initialize();
+        await fs.writeFile(path.join(root,'main.tex'),bytes('local change'));
+        adapter.remote.set('incoming.tex',bytes('remote only'));
+        await coordinator.scan('bootstrap','manual');
+        await coordinator.syncGroupPath('incoming.tex','outgoing');
+        assert.strictEqual(await adapter.readLocal('incoming.tex'),undefined);
+        await coordinator.syncGroupPath('main.tex','outgoing');
+        assert.strictEqual(Buffer.from(adapter.remote.get('main.tex')!).toString(),'local change');
+        assert.strictEqual(await adapter.readLocal('incoming.tex'),undefined);
+        await coordinator.syncGroupPath('incoming.tex','incoming');
+        assert.strictEqual(Buffer.from((await adapter.readLocal('incoming.tex'))!).toString(),'remote only');
+    });
+
+    test('group synchronization preserves dirty files and does not reverse direction after a stale display',async()=>{
+        const coordinator=new SyncCoordinator(store,adapter,'manual'); await coordinator.initialize();
+        await fs.writeFile(path.join(root,'main.tex'),bytes('outgoing'));
+        await coordinator.scan('bootstrap','manual');
+        adapter.dirty=true;
+        await coordinator.syncGroupPath('main.tex','outgoing');
+        assert.strictEqual(adapter.applyCount,0);
+        adapter.dirty=false;
+        await fs.writeFile(path.join(root,'main.tex'),bytes('base\n'));
+        adapter.remote.set('main.tex',bytes('new remote'));
+        await coordinator.syncGroupPath('main.tex','outgoing');
+        assert.strictEqual(await fs.readFile(path.join(root,'main.tex'),'utf8'),'base\n');
+        assert.strictEqual(coordinator.records().find(record=>record.path==='main.tex')?.status,'pending-download');
+        assert.strictEqual(adapter.applyCount,0);
+    });
+
     test('remote directory events reconcile children without reading the folder as a binary file',async()=>{
         adapter.directories.add('resources');
         const coordinator=new SyncCoordinator(store,adapter,'safeAuto'); await coordinator.initialize();
