@@ -15,6 +15,7 @@ export interface SyncAdapter {
     checkPath?(path:string):Promise<PathDecision>;
     listPaths():Promise<string[]>;
     listLocalPaths?():Promise<string[]>;
+    remotePathType?(path:string):Promise<'file'|'directory'|'missing'>;
     listIssues?():PathIssue[];
     readLocal(path:string):Promise<Uint8Array|undefined>;
     readRemote(path:string,force?:boolean):Promise<RemoteReadResult|RemoteSnapshot|undefined>;
@@ -126,14 +127,26 @@ export class SyncCoordinator {
             await this.reconcilePath(path,'local');
         } catch (error:any) { await this.setError(path,error?.message??String(error)); }
     }); }
-    handleRemote(path:string):Promise<void> { return this.enqueue(path,async()=>{
-        try {
-            if (await this.syncOnlineText(path)) { return; }
-            const snapshot=unwrapRemoteRead(await this.adapter.readRemote(path,true));
-            if (this.suppressor.consume('remote',normalizePath(path),snapshot?.hash)) { return; }
-            await this.reconcilePath(path,'remote');
-        } catch (error:any) { await this.setError(path,error?.message??String(error)); }
-    }); }
+    async handleRemote(path:string):Promise<void> {
+        const decision=await this.adapter.checkPath?.(path);
+        if (decision && decision.type!=='allowed') { await this.enqueue(path,async()=>{}); return; }
+        const directory=await this.adapter.remotePathType?.(path)==='directory';
+        await this.enqueue(path,async()=>{
+            try {
+                if (await this.syncOnlineText(path)) { return; }
+                const snapshot=unwrapRemoteRead(await this.adapter.readRemote(path,true));
+                if (this.suppressor.consume('remote',normalizePath(path),snapshot?.hash)) { return; }
+                await this.reconcilePath(path,'remote');
+            } catch (error:any) { await this.setError(path,error?.message??String(error)); }
+        });
+        if (directory && !this.find(path)?.suspension) {
+            // A directory move/create can arrive without individual child events.
+            // Enumerate names, but only reconcile descendants of this directory.
+            for (const child of await this.adapter.listPaths()) {
+                if (normalizePath(child).startsWith(normalizePath(path)+'/')) { await this.handleRemote(child); }
+            }
+        }
+    }
     async markUnstable(path:string):Promise<void> {
         await this.enqueue(path,async()=>{
             const normalized=normalizePath(path);
@@ -266,6 +279,7 @@ export class SyncCoordinator {
         for (const path of paths) {
             if (!await this.allowPath(path)) { continue; }
             const record=this.find(path);
+            if ((await this.store.access.stat(path))?.isDirectory()) { await this.handleLocal(path); continue; }
             const local=await this.adapter.readLocal(path);
             if ((local&&contentHash(local))!==record?.observed.localHash) {
                 await this.handleLocal(path);
@@ -445,7 +459,7 @@ export class SyncCoordinator {
             await gate;
             if (this.stopped) { return; }
             if (!this.isOwner) { throw new Error('Another window owns this replica'); }
-            if (await this.allowPath(path)) { await operation(); }
+            if (await this.allowPath(path) && !await this.skipDirectory(path)) { await operation(); }
         }).finally(()=>{
             this.adapter.syncActivity?.(path,false);
             if (this.queues.get(key)===next) { this.queues.delete(key); }
@@ -457,6 +471,35 @@ export class SyncCoordinator {
     private async withTreeLock<T>(operation:()=>Promise<T>):Promise<T> {
         const result=this.treeQueue.catch(()=>undefined).then(operation);
         this.treeQueue=result.catch(()=>undefined); return result;
+    }
+
+    /** Directories are structure, never binary upload candidates. */
+    private async skipDirectory(path:string):Promise<boolean> {
+        const local=await this.store.access.stat(path);
+        const remoteType=await this.adapter.remotePathType?.(path);
+        if (!local?.isDirectory() && remoteType!=='directory') { return false; }
+        const record=this.find(path);
+        if ((local?.isDirectory() && remoteType==='file') || (local?.isFile() && remoteType==='directory')) {
+            await this.setFrozen(path,'A file and a directory occupy the same path. Rename one side before synchronizing.');
+            return true;
+        }
+        if (!record) { return true; }
+        // Remove only the content-free error record made by older folder events.
+        // Real file baselines, conflicts and interrupted writes must survive.
+        const journal=await this.store.listJournal();
+        const placeholder=remoteType!==undefined && record.status==='error' && !record.base && !record.entityId && !record.pendingConflictId
+            && !record.observed.localHash && !record.observed.remoteHash
+            && !this.blockedRecovery.has(pathComparisonKey(path)) && !this.blockedLocalRecovery.has(normalizePath(path))
+            && !journal.some(entry=>entry.path===path || entry.sourcePath===path) && !await this.store.hasUncertainRecovery()
+            && record.message===`Replica file changed during open: ${path}`;
+        if (placeholder) {
+            delete this.state.files[record.key];
+            this.compileConfirmations.delete(pathComparisonKey(path));
+            await this.persist();
+        } else {
+            await this.setFrozen(path,'This path is now a directory. Previous file state was retained; review the file/directory replacement before syncing.');
+        }
+        return true;
     }
 
     private find(path:string):FileSyncRecord|undefined {

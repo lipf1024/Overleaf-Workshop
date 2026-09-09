@@ -22,6 +22,36 @@ suite('OT subscription and recovery',()=>{
             assert.strictEqual(await f.manager.get('doc'),a); assert.strictEqual(f.joins(),1);
         } finally { f.manager.dispose(); }
     });
+    test('scoped compile barrier waits for its ACK while unrelated documents remain unconfirmed',async()=>{
+        // Separate journals, as in production; no shared baseline between documents.
+        const journals=new Map<string,OtJournal>();
+        const manager=new OtDocuments({readOtJournal:async(id:string)=>journals.get(id),writeOtJournal:async(id:string,j:OtJournal)=>{journals.set(id,j);},close:async()=>{}} as any,{
+            join:async()=>({docLines:['ABC'],version:0,updates:[]}),source:()=> 'self',send:async()=>{},changed:()=>{},error:()=>{},log:()=>{},
+        });
+        const a=await manager.get('a'),b=await manager.get('b');
+        const first=a.save('ABCD'),other=b.save('ABCX');
+        void other.catch(()=>undefined);
+        try {
+            let finished=false;
+            const barrier=manager.barrier(['a']).then(()=>{finished=true;});
+            await new Promise(resolve=>setImmediate(resolve)); assert.strictEqual(finished,false);
+            manager.receive({doc:'a',v:0}); await first; await barrier;
+            assert.strictEqual(finished,true); assert.strictEqual(b.pending,true);
+        } finally { manager.dispose(); }
+    });
+    test('later saves on the same document cannot extend an already captured compile barrier',async()=>{
+        const f=fixture();
+        const a=await f.manager.get('doc');
+        try {
+            const first=a.save('ABCD');
+            const barrier=f.manager.barrier(['doc']);
+            const later=a.save('ABCDE'); void later.catch(()=>undefined);
+            await new Promise(resolve=>setImmediate(resolve));
+            f.manager.receive({doc:'doc',v:0}); await first; await barrier;
+            assert.strictEqual(a.pending,true);
+            f.manager.receive({doc:'doc',v:1}); await later;
+        } finally { f.manager.dispose(); }
+    });
     test('reconnection requests the persisted version and consumes contiguous history',async()=>{
         const f=fixture();
         try {

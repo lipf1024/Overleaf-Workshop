@@ -84,7 +84,10 @@ export class OtDocuments {
     }
     disconnect():void { for (const entry of this.entries.values()) { entry.session?.disconnect(); } }
     async reconnect():Promise<void> { await Promise.allSettled([...this.entries.keys()].map(id=>this.get(id))); }
-    barrier():Promise<void> { return Promise.all([...this.entries.values()].map(entry=>entry.session?.barrier())).then(()=>undefined); }
+    barrier(ids?:readonly string[]):Promise<void> {
+        const entries=ids?[...new Set(ids)].map(id=>this.entries.get(id)):[...this.entries.values()];
+        return Promise.all(entries.map(entry=>entry?.session?.barrier())).then(()=>undefined);
+    }
     dispose():void {
         this.closed=true;
         for (const entry of this.entries.values()) { entry.session?.dispose(); }

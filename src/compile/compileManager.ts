@@ -130,7 +130,7 @@ export class CompileManager {
     public inCompiling: boolean = false;
     private diagnosticProvider: CompileDiagnosticProvider;
     private activeRun?:{cancelled:boolean;controller:AbortController;context?:ProjectContext;vfs?:import('../core/remoteFileSystemProvider').VirtualFileSystem};
-    private queuedCompile?:{force:boolean;requestedUri?:vscode.Uri};
+    private queuedCompile?:{force:boolean;requestedUri?:vscode.Uri;sources:vscode.Uri[]};
     private readonly autoCompilePaused=new Set<string>();
     private pdfListener:vscode.Disposable;
     private compileAsDraft: boolean = false;
@@ -184,15 +184,16 @@ export class CompileManager {
         this.status.show(); return context.remoteRoot;
     }
 
-    async compile(force=false,requestedUri?:vscode.Uri):Promise<void> {
+    async compile(force=false,requestedUri?:vscode.Uri,additionalSources:readonly vscode.Uri[]=[]):Promise<void> {
+        const source=requestedUri??vscode.window.activeTextEditor?.document.uri;
         if (this.inCompiling) {
-            this.queuedCompile={force:force||this.queuedCompile?.force===true,requestedUri:requestedUri??this.queuedCompile?.requestedUri};
+            this.queuedCompile={force:force||this.queuedCompile?.force===true,requestedUri:source??this.queuedCompile?.requestedUri,
+                sources:[...new Map([...(this.queuedCompile?.sources??[]),...additionalSources,...(source?[source]:[])].map(uri=>[uri.toString(),uri])).values()]};
             return;
         }
         this.inCompiling=true;
         const run:{cancelled:boolean;controller:AbortController;context?:ProjectContext;vfs?:import('../core/remoteFileSystemProvider').VirtualFileSystem}={cancelled:false,controller:new AbortController()};
         this.activeRun=run;
-        const source=requestedUri??vscode.window.activeTextEditor?.document.uri;
         let completionMessage='Compilation paused; keeping the previous PDF';
         try {
             const context=await resolveProjectContext(source); run.context=context;
@@ -205,16 +206,32 @@ export class CompileManager {
             if (!force && !Object.keys(pdfViewRecord[context.key]??{}).length) { return; }
             this.previewState(context,true,'Syncing saved changes…');
             const syncingStarted=Date.now();
+            const vfs=await this.vfsm.prefetch(context.remoteRoot); run.vfs=vfs;
+            const savedUris:vscode.Uri[]=[];
+            const remoteUris:vscode.Uri[]=[];
+            const include=async(uri:vscode.Uri)=>{
+                const owner=await resolveProjectContext(uri);
+                if (owner?.key!==context.key || !owner.relativePath || owner.relativePath.startsWith(OUTPUT_FOLDER_NAME+'/')) { return; }
+                if (owner.sourceUri) { savedUris.push(owner.sourceUri); }
+                if (owner.remoteSource) { remoteUris.push(owner.remoteSource); }
+            };
+            for (const uri of [source,...additionalSources]) { if (uri) { await include(uri); } }
+            // A compile launched from the PDF or project root still checks the main source.
+            if (!savedUris.length) { await include(sourceUriFor(context,vfs.getRootDocName().replace(/^\//,''))); }
             const dirty=vscode.workspace.textDocuments.filter(document=>document.isDirty);
             for (const document of dirty) {
                 const owner=await resolveProjectContext(document.uri);
-                if (owner?.key===context.key && !await document.save()) {
-                    void vscode.window.showWarningMessage('Compilation was paused because some files could not be saved.'); return;
+                if (owner?.key===context.key) {
+                    await include(document.uri);
+                    if (!await document.save()) {
+                        completionMessage='Compilation paused: a project file could not be saved; keeping the previous PDF';
+                        void vscode.window.showWarningMessage(completionMessage); return;
+                    }
                 }
             }
-            if (run.cancelled || !await LocalReplicaSCMProvider.prepareForCompile(context.sourceUri??context.localRoot)) { return; }
-            const vfs=await this.vfsm.prefetch(context.remoteRoot); run.vfs=vfs;
-            await vfs.waitForSavedText();
+            if (run.cancelled || !await LocalReplicaSCMProvider.prepareForCompile(context.localRoot??context.sourceUri,savedUris,
+                message=>{completionMessage=message+' Keeping the previous PDF.';})) { return; }
+            await vfs.waitForSavedText(remoteUris);
             vfs.logSyncStage('compile-wait',Date.now()-syncingStarted);
             await this.update('compiling',context);
             this.previewState(context,true,'Compiling PDF…');
@@ -285,7 +302,7 @@ export class CompileManager {
                 this.activeRun=undefined; this.inCompiling=false;
                 const queued=run.cancelled?undefined:this.queuedCompile;
                 this.queuedCompile=undefined;
-                if (queued) { await this.compile(queued.force,queued.requestedUri); }
+                if (queued) { await this.compile(queued.force,queued.requestedUri,queued.sources); }
             }
         }
     }

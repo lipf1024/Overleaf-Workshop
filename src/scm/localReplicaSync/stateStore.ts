@@ -270,7 +270,7 @@ export class SyncStateStore {
         return id;
     }
 
-    private async hasUncertainRecovery():Promise<boolean> {
+    async hasUncertainRecovery():Promise<boolean> {
         return this.journalCorrupt || (await this.access.list('.overleaf/sync',true)).some(entry=>/^(state|journal)\.json\.corrupt-/.test(entry.name));
     }
 

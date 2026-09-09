@@ -12,6 +12,8 @@ const bytes=(value:string)=>new TextEncoder().encode(value);
 
 class FakeAdapter implements SyncAdapter {
     remote=new Map<string,Uint8Array>();
+    directories=new Set<string>();
+    async remotePathType(name:string):Promise<'file'|'directory'|'missing'> { return this.directories.has(name)?'directory':this.remote.has(name)?'file':'missing'; }
     remoteIds=new Map<string,string>();
     version=1;
     epoch=1;
@@ -72,6 +74,75 @@ suite('SyncCoordinator fault safety',()=>{
         adapter=new FakeAdapter(root); adapter.remote.set('main.tex',bytes('base\n')); adapter.remoteIds.set('main.tex','doc-1');
     });
     teardown(async()=>{ await store.close(); await fs.rm(root,{recursive:true,force:true}); });
+
+    test('remote directory events reconcile children without reading the folder as a binary file',async()=>{
+        adapter.directories.add('resources');
+        const coordinator=new SyncCoordinator(store,adapter,'safeAuto'); await coordinator.initialize();
+        adapter.remote.set('resources/figure.pdf',bytes('remote figure'));
+        adapter.remote.set('main.tex',bytes('unrelated remote change'));
+        let directoryReads=0;
+        const read=adapter.readLocal.bind(adapter);
+        adapter.readLocal=async name=>{ if(name==='resources'){directoryReads++;throw new Error('directory read');}return read(name); };
+        await coordinator.handleRemote('resources');
+        assert.strictEqual(directoryReads,0);
+        assert.strictEqual(coordinator.records().some(record=>record.path==='resources'),false);
+        assert.strictEqual(coordinator.records().find(record=>record.path==='resources/figure.pdf')?.status,'clean');
+        assert.strictEqual(await fs.readFile(path.join(root,'resources','figure.pdf'),'utf8'),'remote figure');
+        assert.strictEqual(await fs.readFile(path.join(root,'main.tex'),'utf8'),'base\n');
+        assert.strictEqual(adapter.applyCount,0);
+    });
+
+    test('startup removes only legacy empty directory errors and preserves the directory contents',async()=>{
+        await fs.mkdir(path.join(root,'resources'));
+        await fs.writeFile(path.join(root,'resources','figure.pdf'),bytes('local figure'));
+        adapter.directories.add('resources');
+        const loaded=await store.loadState();
+        loaded.state.files['local:resources']={key:'local:resources',path:'resources',kind:'binary',observed:{},status:'error',message:'Replica file changed during open: resources'};
+        await store.saveState(loaded.state);
+        const coordinator=new SyncCoordinator(store,adapter,'safeAuto'); await coordinator.initialize();
+        assert.strictEqual(coordinator.records().some(record=>record.path==='resources'),false);
+        await coordinator.syncPath('resources'); await coordinator.refreshLocalChanges();
+        assert.strictEqual(coordinator.records().some(record=>record.path==='resources'),false);
+        assert.strictEqual(await fs.readFile(path.join(root,'resources','figure.pdf'),'utf8'),'local figure');
+        assert.strictEqual(adapter.applyCount,0);
+        assert.strictEqual(Object.values((await store.loadState()).state.files).some(record=>record.path==='resources'),false);
+    });
+
+    for (const recovery of ['active','corrupt']) {
+        test(`directory cleanup preserves ${recovery} recovery state`,async()=>{
+            await fs.mkdir(path.join(root,'resources')); adapter.directories.add('resources');
+            const loaded=await store.loadState();
+            loaded.state.files['local:resources']={key:'local:resources',path:'resources',kind:'binary',observed:{},status:'error',message:'Replica file changed during open: resources'};
+            await store.saveState(loaded.state);
+            if (recovery==='active') { await store.beginJournal({path:'resources',operation:'upload',targetHash:'unknown'}); }
+            else { await fs.writeFile(path.join(root,'.overleaf','sync','journal.json'),'{broken'); }
+            const coordinator=new SyncCoordinator(store,adapter,'safeAuto'); await coordinator.initialize();
+            assert.strictEqual(coordinator.records().find(record=>record.path==='resources')?.suspension,'blocked');
+            if (recovery==='active') { assert.strictEqual((await store.listJournal()).length,1); }
+            else { assert.strictEqual(await store.hasUncertainRecovery(),true); }
+            assert.strictEqual(adapter.applyCount,0);
+        });
+    }
+
+    test('a real file replaced by a directory retains its baseline and stops writes',async()=>{
+        const coordinator=new SyncCoordinator(store,adapter,'safeAuto'); await coordinator.initialize();
+        const base=coordinator.records().find(record=>record.path==='main.tex')!.base;
+        await fs.unlink(path.join(root,'main.tex')); await fs.mkdir(path.join(root,'main.tex'));
+        await coordinator.handleLocal('main.tex');
+        const record=coordinator.records().find(record=>record.path==='main.tex')!;
+        assert.deepStrictEqual(record.base,base); assert.strictEqual(record.suspension,'blocked');
+        assert.strictEqual(adapter.applyCount,0); assert.ok(adapter.remote.has('main.tex'));
+    });
+
+    test('a local file colliding with a remote directory is retained, not uploaded or deleted',async()=>{
+        await fs.writeFile(path.join(root,'resources'),bytes('local file'));
+        adapter.directories.add('resources');
+        const coordinator=new SyncCoordinator(store,adapter,'safeAuto'); await coordinator.initialize();
+        await coordinator.handleRemote('resources');
+        assert.strictEqual(coordinator.records().find(record=>record.path==='resources')?.suspension,'blocked');
+        assert.strictEqual(await fs.readFile(path.join(root,'resources'),'utf8'),'local file');
+        assert.strictEqual(adapter.applyCount,0);
+    });
 
     test('repeated manual sync clicks share one run and allow another after completion',async()=>{
         const coordinator=new SyncCoordinator(store,adapter,'safeAuto'); await coordinator.initialize();

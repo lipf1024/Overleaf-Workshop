@@ -774,7 +774,20 @@ export class VirtualFileSystem extends vscode.Disposable {
         return {path:uri.path,entityId:fileEntity!._id,kind:'text',content,hash,
             revision:{kind:'document',documentVersion:session.version,contentHash:hash},connectionEpoch:this.socket.connectionEpoch};
     }
-    async waitForSavedText():Promise<void> { await this.otDocuments?.barrier(); }
+    async waitForSavedText(uris?:readonly vscode.Uri[]):Promise<void> {
+        if (!this.otDocuments) { return; }
+        if (!uris) { await this.otDocuments.barrier(); return; }
+        const ids=await Promise.all(uris.map(async uri=>{
+            try { return (await this._resolveUri(uri)).fileEntity?._id; }
+            catch (error) {
+                // Ignored local paths can be absent remotely and have no OT session.
+                // Required local uploads were checked by compile preparation already.
+                if (error instanceof vscode.FileSystemError && error.code==='FileNotFound') { return undefined; }
+                throw error;
+            }
+        }));
+        await this.otDocuments.barrier(ids.filter((id):id is string=>!!id));
+    }
     logSyncStage(stage:string,elapsed:number):void { this.otOutput?.appendLine(`${new Date().toISOString()} ${stage} ${elapsed}ms`); }
 
     async openFile(uri: vscode.Uri): Promise<Uint8Array> {

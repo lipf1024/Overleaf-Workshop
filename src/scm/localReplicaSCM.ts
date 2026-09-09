@@ -10,6 +10,7 @@ import { ConflictPresentation } from './localReplicaSync/conflictPresentation';
 import { hasUnresolvedConflict } from './localReplicaSync/conflictState';
 import { LocalPathAccess, PathPolicy } from './localReplicaSync/pathPolicy';
 import { ReplicaOtBridge } from './localReplicaSync/otBridge';
+import { syncDecoration } from './localReplicaSync/syncDecoration';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 
@@ -60,6 +61,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private treeQueue:Promise<void>=Promise.resolve();
     private scanIssues:PathIssue[]=[];
     private initializingSync=true;
+    private lastCompileNotice?:string;
     private ignorePatterns: string[] = [
         '**/.*',
         '**/.*/**',
@@ -91,28 +93,39 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         super(vfs, baseUri);
     }
 
-    public static async prepareForCompile(uri?:vscode.Uri):Promise<boolean> {
+    public static async prepareForCompile(uri?:vscode.Uri,savedUris:readonly vscode.Uri[]=[],onPaused?:(message:string)=>void):Promise<boolean> {
         const provider=uri?[...this.instances].find(item=>uri.scheme==='file'&&(uri.fsPath===item.baseUri.fsPath||uri.fsPath.startsWith(item.baseUri.fsPath+path.sep))):this.activeProvider();
         if (!provider?.coordinator) { return true; }
-        const relative=uri?.scheme==='file' && uri.fsPath!==provider.baseUri.fsPath
-            ? path.relative(provider.baseUri.fsPath,uri.fsPath).split(path.sep).join('/')
-            : undefined;
-        const published=relative
-            ? ()=>provider.coordinator!.isObservedLocalPathPublished(relative)
-            : ()=>provider.coordinator!.isObservedLocalStatePublished();
-        if (!provider.coordinator.isOwner && !await published()) {
-            void vscode.window.showWarningMessage('Compile paused: the synchronization window has not confirmed these local files on Overleaf yet.');
-            return false;
-        }
-        if (provider.coordinator.isOwner) {
-            await provider.coordinator.flushCurrent();
-            if (relative) { await provider.coordinator.prepareLocalForCompile(relative); }
-            await provider.coordinator.flushCurrent();
-        }
-        const pending=provider.coordinator.records().filter(record=>record.status!=='clean' && record.suspension!=='ignored');
-        if (!pending.length) { return true; }
-        void vscode.window.showWarningMessage(`Compile paused: ${pending.length} local replica change(s) are not on Overleaf. Review Source Control or run “Local Replica: Sync Now”.`);
-        return false;
+        const coordinator=provider.coordinator;
+        const paths=[...new Set([uri,...savedUris].filter((item):item is vscode.Uri=>!!item && item.scheme==='file'
+            && item.fsPath.startsWith(provider.baseUri.fsPath+path.sep)).map(item=>path.relative(provider.baseUri.fsPath,item.fsPath).split(path.sep).join('/')))];
+        const pause=(message:string)=>{ onPaused?.(message); void vscode.window.showWarningMessage(message); return false; };
+        // Capture this round's paths once. Each per-file queue includes its upload and
+        // structural prerequisites; unrelated queues and later saves do not extend it.
+        const results=await Promise.all(paths.map(async relative=>{
+            try {
+                if (!coordinator.isOwner) {
+                    return {path:relative,ready:await coordinator.isObservedLocalPathPublished(relative)};
+                }
+                await coordinator.prepareLocalForCompile(relative);
+                const record=coordinator.records().find(item=>item.path===relative);
+                return {path:relative,ready:record?.suspension==='ignored' || (!!record && record.status==='clean' && !record.suspension && !hasUnresolvedConflict(record)),message:record?.message};
+            } catch (error) {
+                return {path:relative,ready:false,message:error instanceof Error?error.message:String(error)};
+            }
+        }));
+        const blocked=results.find(result=>!result.ready);
+        if (blocked) { return pause(`Compile paused: ${blocked.path} is not confirmed on Overleaf. ${blocked.message??'Sync this file or resolve its pending changes.'}`); }
+        const pending=coordinator.records().filter(record=>!paths.includes(record.path) && record.status!=='clean' && record.suspension!=='ignored');
+        if (pending.length) {
+            const message=`Compiling confirmed changes; ${pending.length} other local file(s) remain unsynchronized. The build uses their current Overleaf versions. Review Source Control.`;
+            provider.output?.appendLine(`${new Date().toISOString()} ${message}`);
+            // Avoid a notification on every save while the same files remain pending.
+            const notice=pending.map(record=>`${record.path}:${record.status}`).sort().join('|');
+            if (notice!==provider.lastCompileNotice) { void vscode.window.showWarningMessage(message); }
+            provider.lastCompileNotice=notice;
+        } else { provider.lastCompileNotice=undefined; }
+        return true;
     }
 
     private static activeProvider():LocalReplicaSCMProvider|undefined {
@@ -330,6 +343,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const adapter:SyncAdapter={
             establishText:(path,snapshot)=>textBridge.establish(path,snapshot),
             syncText:path=>textBridge.sync(path),
+            remotePathType:async path=>{
+                try {
+                    const resolved=await this.vfs._resolveUri(this.vfs.pathToUri('/'+path));
+                    return !resolved.fileEntity?'missing':resolved.fileType==='folder'?'directory':'file';
+                } catch (error) { if (isFileNotFound(error)) { return 'missing'; } throw error; }
+            },
             checkPath:path=>this.policy.check(path),
             listPaths:()=>this.listAllPaths(), listLocalPaths:()=>this.listLocalPaths(), listIssues:()=>this.scanIssues, readLocal:async path=>await this.readFile(path),
             readRemote:async(path,force)=>{
@@ -481,16 +500,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     private updateSourceControl(records:FileSyncRecord[]):void {
-        const item=(record:FileSyncRecord):vscode.SourceControlResourceState=>({resourceUri:vscode.Uri.joinPath(this.baseUri,record.path),
+        const item=(record:FileSyncRecord):vscode.SourceControlResourceState=>{
+            const decoration=syncDecoration(record);
+            return {resourceUri:vscode.Uri.joinPath(this.baseUri,record.path),
             command:record.pendingConflictId && this.coordinator?.isOwner && !record.suspension?{command:'overleaf-workshop.localReplica.openConflict',title:'Open Conflict Editor',arguments:[record.pendingConflictId]}:undefined,
             contextValue:hasUnresolvedConflict(record)?'overleafConflict':!record.suspension?'overleafSyncFile':undefined,
-            decorations:{tooltip:hasUnresolvedConflict(record)?'Overleaf conflict: '+(record.message??'Synchronization paused'):record.message,
-                iconPath:hasUnresolvedConflict(record)?new vscode.ThemeIcon('warning',new vscode.ThemeColor('gitDecoration.conflictingResourceForeground')):undefined}});
+            decorations:{tooltip:decoration?.tooltip,
+                iconPath:decoration?new vscode.ThemeIcon(decoration.icon,new vscode.ThemeColor(decoration.color)):undefined}};
+        };
         this.incoming!.resourceStates=records.filter(r=>!r.suspension && !hasUnresolvedConflict(r) && (r.status==='pending-download'||r.status==='remote-changed')).map(item);
         this.outgoing!.resourceStates=records.filter(r=>!r.suspension && !hasUnresolvedConflict(r) && (r.status==='pending-upload'||r.status==='local-changed'||r.status==='error')).map(item);
         this.conflicts!.resourceStates=records.filter(r=>!r.suspension && hasUnresolvedConflict(r)).map(item);
         this.paused!.resourceStates=records.filter(r=>r.suspension && r.suspension!=='ignored').map(item);
-        this.conflictPresentation?.update(records.filter(r=>!r.suspension),!this.initializingSync && !!this.coordinator?.isOwner);
+        this.conflictPresentation?.update(records,!this.initializingSync && !!this.coordinator?.isOwner);
         for (const record of records.filter(item=>item.status==='error' && item.message)) {
             if (this.loggedErrors.get(record.path)===record.message) { continue; }
             this.loggedErrors.set(record.path,record.message!);

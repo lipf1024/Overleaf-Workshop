@@ -170,12 +170,86 @@ suite('0.16.7 remote and runtime regressions',()=>{
         const {LocalReplicaSCMProvider}=isolatedModule('scm/localReplicaSCM',{...r.common,'.':{BaseSCM:class {}},'../core/remoteFileSystemProvider':r.core,'./localReplicaSync':{},'./localReplicaSync/conflictPresentation':{ConflictPresentation:class {}}});
         const provider:any=Object.create(LocalReplicaSCMProvider.prototype),handled:string[]=[]; let flushes=0,fullScans=0;
         Object.assign(provider,{baseUri:Uri.file('/replica'),coordinator:{isOwner:true,flushCurrent:async()=>{flushes++;},prepareLocalForCompile:async(value:string)=>{handled.push(value);},
-            refreshLocalChanges:async()=>{fullScans++;},records:()=>[]}});
+            refreshLocalChanges:async()=>{fullScans++;},records:()=>[{path:'chapters/main.tex',status:'clean'}]}});
         LocalReplicaSCMProvider.instances.add(provider);
         try {
             assert.strictEqual(await LocalReplicaSCMProvider.prepareForCompile(Uri.file('/replica/chapters/main.tex')),true);
-            assert.deepStrictEqual(handled,['chapters/main.tex']); assert.strictEqual(flushes,2); assert.strictEqual(fullScans,0);
+            assert.deepStrictEqual(handled,['chapters/main.tex']); assert.strictEqual(flushes,0); assert.strictEqual(fullScans,0);
         } finally { LocalReplicaSCMProvider.instances.delete(provider); }
+    });
+
+    test('compile permits unrelated pending files but blocks a saved file with a reason',async()=>{
+        const r=runtime();
+        const {LocalReplicaSCMProvider}=isolatedModule('scm/localReplicaSCM',{...r.common,'.':{BaseSCM:class {}},'../core/remoteFileSystemProvider':r.core,'./localReplicaSync':{},'./localReplicaSync/conflictPresentation':{ConflictPresentation:class {}}});
+        const records=[{path:'main.tex',status:'clean'}, {path:'notes.md',status:'pending-upload'},
+            {path:'figure.pdf',status:'pending-upload',message:'Binary uploads require explicit confirmation'}];
+        const handled:string[]=[];
+        const provider={baseUri:Uri.file('/replica'),coordinator:{isOwner:true,records:()=>records,
+            flushCurrent:()=>{throw new Error('Unrelated queue must not be awaited');},prepareLocalForCompile:async(p:string)=>{handled.push(p);}}};
+        LocalReplicaSCMProvider.instances.add(provider);
+        try {
+            assert.strictEqual(await LocalReplicaSCMProvider.prepareForCompile(Uri.file('/replica'),[Uri.file('/replica/main.tex')]),true);
+            assert.deepStrictEqual(handled,['main.tex']);
+            assert.ok(r.messages[0].includes('2 other local file(s)'));
+            let reason='';
+            assert.strictEqual(await LocalReplicaSCMProvider.prepareForCompile(Uri.file('/replica'),[Uri.file('/replica/main.tex'),Uri.file('/replica/figure.pdf')],(value:string)=>{reason=value;}),false);
+            assert.ok(reason.includes('figure.pdf')); assert.ok(reason.includes('explicit confirmation'));
+            records[0].status='conflict';
+            assert.strictEqual(await LocalReplicaSCMProvider.prepareForCompile(Uri.file('/replica/main.tex')),false);
+            provider.coordinator.prepareLocalForCompile=async()=>{throw new Error('confirmation unknown');};
+            assert.strictEqual(await LocalReplicaSCMProvider.prepareForCompile(Uri.file('/replica/main.tex'),[],(value:string)=>{reason=value;}),false);
+            assert.ok(reason.includes('main.tex')); assert.ok(reason.includes('confirmation unknown'));
+        } finally { LocalReplicaSCMProvider.instances.delete(provider); }
+    });
+
+    test('scoped VFS wait includes only selected OT IDs and tolerates absent ignored paths',async()=>{
+        const r=runtime(),vfs:any=Object.create(r.core.VirtualFileSystem.prototype);
+        let ids:string[]=[];
+        vfs.otDocuments={barrier:async(value:string[])=>{ids=value;}};
+        vfs._resolveUri=async(uri:Uri)=>{
+            if (uri.path.endsWith('.aux')) { throw FileSystemError.FileNotFound(); }
+            return {fileEntity:{_id:'selected-document'}};
+        };
+        await vfs.waitForSavedText([remote(),remote('p','ignored/file.aux')]);
+        assert.deepStrictEqual(ids,['selected-document']);
+        vfs._resolveUri=async()=>{throw new Error('connection failed');};
+        await assert.rejects(vfs.waitForSavedText([remote()]),/connection failed/);
+    });
+
+    test('compile observer checks every saved path and excludes other projects',async()=>{
+        const r=runtime();
+        const {LocalReplicaSCMProvider}=isolatedModule('scm/localReplicaSCM',{...r.common,'.':{BaseSCM:class {}},'../core/remoteFileSystemProvider':r.core,'./localReplicaSync':{},'./localReplicaSync/conflictPresentation':{ConflictPresentation:class {}}});
+        const checked:string[]=[];
+        const provider={baseUri:Uri.file('/replica'),coordinator:{isOwner:false,records:()=>[],
+            isObservedLocalPathPublished:async(p:string)=>{checked.push(p);return p==='main.tex';}}};
+        LocalReplicaSCMProvider.instances.add(provider);
+        try {
+            assert.strictEqual(await LocalReplicaSCMProvider.prepareForCompile(Uri.file('/replica'),[Uri.file('/replica/main.tex'),Uri.file('/replica/chapter.tex'),Uri.file('/other/main.tex')]),false);
+            assert.deepStrictEqual(checked,['main.tex','chapter.tex']);
+        } finally { LocalReplicaSCMProvider.instances.delete(provider); }
+    });
+
+    test('Explorer decorations clear after synchronization and distinguish pending directions',()=>{
+        const r=runtime();
+        r.vscode.window.registerFileDecorationProvider=()=>new Disposable();
+        const {ConflictPresentation}=isolatedModule('scm/localReplicaSync/conflictPresentation',{vscode:r.vscode});
+        const presentation=new ConflictPresentation(Uri.file('/replica'),async()=>{});
+        const file=Uri.file('/replica/figure.pdf');
+        const record:any={path:'figure.pdf',status:'pending-upload',kind:'binary',observed:{}};
+        try {
+            presentation.update([record],false);
+            assert.strictEqual(presentation.provideFileDecoration(file).badge,'A');
+            record.base={}; presentation.update([record],false);
+            assert.strictEqual(presentation.provideFileDecoration(file).badge,'M');
+            record.status='pending-download'; presentation.update([record],false);
+            assert.ok(presentation.provideFileDecoration(file).tooltip.includes('pending download'));
+            record.suspension='blocked'; presentation.update([record],false);
+            assert.strictEqual(presentation.provideFileDecoration(file).badge,'P');
+            record.suspension='ignored'; presentation.update([record],false);
+            assert.strictEqual(presentation.provideFileDecoration(file),undefined);
+            record.suspension=undefined; record.status='clean'; presentation.update([record],false);
+            assert.strictEqual(presentation.provideFileDecoration(file),undefined);
+        } finally { presentation.dispose(); }
     });
 
     test('B06: Unicode is decoded exactly once for each WebSocket transport',async()=>{
@@ -324,8 +398,9 @@ suite('0.16.7 remote and runtime regressions',()=>{
         const source=Uri.file(path.join(root,'p','chapters','main.tex'));
         r.vscode.window.activeTextEditor={document:{uri:source},selection:{start:{line:2,character:3}}};
         const context=isolatedModule('compile/projectContext',{...r.common,'../core/remoteFileSystemProvider':r.core});
+        const prepared:Uri[][]=[];
         const compile=isolatedModule('compile/compileManager',{...r.common,'../core/remoteFileSystemProvider':r.core,'./projectContext':context,
-            '../scm/localReplicaSCM':{LocalReplicaSCMProvider:{prepareForCompile:async()=>true}},
+            '../scm/localReplicaSCM':{LocalReplicaSCMProvider:{prepareForCompile:async(_root:Uri,uris:Uri[])=>{prepared.push(uris);return true;}}},
             './compileLogParser':{LatexParser:class {parse(){return {all:[{file:'./chapters/main.tex',line:1,level:'error',message:'test diagnostic'}]};}}}},timers);
         let compiles=0,refreshes=0; const forward:string[]=[],previewStates:{busy:boolean;message:string}[]=[];
         const vfs:any={logSyncStage:()=>{},waitForSavedText:async()=>{},getRootDocName:()=>'/main.tex',getCompiler:()=>({name:'pdfLaTeX'}),openFile:async()=>Buffer.from('sample\n'),pathToUri:(value:string)=>remote('p',value),
@@ -333,8 +408,37 @@ suite('0.16.7 remote and runtime regressions',()=>{
         const provider={prefetch:async()=>vfs}; const manager=new compile.CompileManager(provider); const disposables=manager.triggers;
         let closePreview=()=>{};
         r.eventBus.fire('pdfWillOpenEvent',{uri:remote('p','.output/output.pdf'),doc:{setCompileState:(busy:boolean,message:string)=>previewStates.push({busy,message}),refresh:async()=>{refreshes++;}},webviewPanel:{onDidDispose:(callback:()=>void)=>{closePreview=callback;return new Disposable();}}});
-        return {...r,root,source,context,compile,manager,provider,vfs,forward,previewStates,closePreview:()=>closePreview(),compiles:()=>compiles,refreshes:()=>refreshes,close:async()=>{closePreview();disposables.forEach((item:Disposable)=>item.dispose());await fs.rm(root,{recursive:true,force:true});}};
+        return {...r,root,source,context,compile,manager,provider,vfs,forward,previewStates,prepared,closePreview:()=>closePreview(),compiles:()=>compiles,refreshes:()=>refreshes,close:async()=>{closePreview();disposables.forEach((item:Disposable)=>item.dispose());await fs.rm(root,{recursive:true,force:true});}};
     }
+
+    test('compile from PDF includes the main source and every dirty file in its project',async()=>{
+        const f=await compileFixture();
+        try {
+            const chapter=Uri.file(path.join(f.root,'p','chapters','main.tex'));
+            f.vscode.workspace.textDocuments=[{uri:chapter,isDirty:true,save:async()=>true}];
+            await f.manager.compile(true,remote('p','.output/output.pdf'));
+            assert.strictEqual(f.compiles(),1);
+            const prepared=f.prepared[0].map(uri=>path.relative(path.join(f.root,'p'),uri.fsPath));
+            assert.deepStrictEqual(prepared,['main.tex','chapters/main.tex']);
+        } finally { await f.close(); }
+    });
+
+    test('coalesced compile retains all saved paths without extending the running batch',async()=>{
+        const f=await compileFixture(); let release!:()=>void,started!:()=>void,calls=0;
+        const gate=new Promise<void>(resolve=>{release=resolve;});
+        const reached=new Promise<void>(resolve=>{started=resolve;});
+        try {
+            f.vfs.compile=async()=>{if (++calls===1) { started(); await gate; } return true;};
+            const current=f.manager.compile(false,f.source); await reached;
+            const a=Uri.file(path.join(f.root,'p','a.tex')),b=Uri.file(path.join(f.root,'p','b.tex'));
+            await f.manager.compile(false,a); await f.manager.compile(false,b);
+            assert.strictEqual(f.prepared.length,1);
+            assert.deepStrictEqual(f.prepared[0].map(uri=>uri.fsPath),[f.source.fsPath]);
+            release(); await current;
+            assert.strictEqual(calls,2);
+            assert.deepStrictEqual([...new Set(f.prepared[1].map(uri=>uri.fsPath))].sort(),[a.fsPath,b.fsPath].sort());
+        } finally { release?.(); await f.close(); }
+    });
 
     test('compile mode offers explicit choices, recompiles the captured project and supports cancellation',async()=>{
         const f=await compileFixture();
@@ -569,12 +673,22 @@ suite('0.16.7 remote and runtime regressions',()=>{
         try {
             f.vscode.workspace.textDocuments=[{uri:f.source,isDirty:true,save:async()=>{saved++;return true;}},
                 {uri:Uri.file(f.source.fsPath.replace('/p/','/q/')),isDirty:true,save:async()=>{unrelated++;return false;}}];
-            f.vfs.waitForSavedText=async()=>{waiting();await new Promise<void>(resolve=>{release=resolve;});};
+            f.vfs.waitForSavedText=async(uris:Uri[])=>{assert.ok(uris.length);assert.ok(uris.every(uri=>uri.toString().includes('project=p')));waiting();await new Promise<void>(resolve=>{release=resolve;});};
             const compiling=f.manager.compile(); await reached;
             assert.strictEqual(saved,1); assert.strictEqual(unrelated,0); assert.strictEqual(f.compiles(),0);
             release(); await compiling; assert.strictEqual(f.compiles(),1);
         } finally { release?.(); await f.close(); }
     });
+    test('failed synchronization preserves the PDF and never sends compile',async()=>{
+        const f=await compileFixture();
+        try {
+            f.vfs.waitForSavedText=async()=>{throw new Error('application confirmation unknown');};
+            await f.manager.compile();
+            assert.strictEqual(f.compiles(),0); assert.strictEqual(f.refreshes(),0);
+            assert.ok(f.previewStates.at(-1)?.message.includes('keeping the previous PDF'));
+        } finally { await f.close(); }
+    });
+
     test('B07: auto-save compiles immediately and refreshes the PDF before diagnostics',async()=>{
         const f=await compileFixture();
         try {

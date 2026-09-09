@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.16.23
+
+- Classify directory events before file synchronization, preventing folders from appearing as failed binary uploads in Outgoing. Reconcile descendant files after remote folder events.
+- Remove old content-free directory error records during owner startup or synchronization. Preserve real file baselines, conflicts, active journals and uncertain recovery state; block file/directory collisions instead of overwriting them.
+
+## 0.16.22
+
+- Compile only waits for files involved in the current save batch; unrelated pending uploads produce a notice instead of blocking compilation. Keep the previous PDF if a required file is not confirmed, and show its path and reason.
+- Scope OT confirmation waits to this batch and retain every saved path when busy compile requests are coalesced.
+- Show Explorer badges and theme colors for new/unuploaded (A), modified/unuploaded (M), incoming (↓), conflicted/error (!), and paused (P) files, with matching Source Control icons. Clear decorations after synchronization.
+- Build and unit validation are automated; live VS Code and browser collaboration remain unverified.
+
 
 ## 0.16.21
 

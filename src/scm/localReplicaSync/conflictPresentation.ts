@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { FileSyncRecord } from './model';
+import { syncDecoration } from './syncDecoration';
 import { ConflictNotificationTracker, hasUnresolvedConflict } from './conflictState';
 
 export class ConflictPresentation implements vscode.FileDecorationProvider, vscode.Disposable {
@@ -21,18 +22,18 @@ export class ConflictPresentation implements vscode.FileDecorationProvider, vsco
     }
 
     update(records:FileSyncRecord[],ready:boolean):void {
-        this.records=records;
-        const conflicts=records.filter(hasUnresolvedConflict);
+        this.records=records.filter(record=>!record.suspension);
+        const conflicts=records.filter(record=>!record.suspension && hasUnresolvedConflict(record));
         const previous=this.decorations;
-        this.decorations=new Map(conflicts.map(record=>[
-            vscode.Uri.joinPath(this.root,record.path).toString(),
-            {
-                badge:'!',
-                color:new vscode.ThemeColor('gitDecoration.conflictingResourceForeground'),
-                tooltip:'Overleaf conflict — synchronization paused. '+(record.message??'Resolve the conflict to resume synchronization.'),
-                propagate:true,
-            },
-        ]));
+        this.decorations=new Map();
+        for (const record of records) {
+            const decoration=syncDecoration(record);
+            if (decoration) {
+                this.decorations.set(vscode.Uri.joinPath(this.root,record.path).toString(),{
+                    badge:decoration.badge,color:new vscode.ThemeColor(decoration.color),tooltip:decoration.tooltip,propagate:true,
+                });
+            }
+        }
         const affected=new Set([...previous.keys(),...this.decorations.keys()]);
         this.changed.fire([...affected].map(uri=>vscode.Uri.parse(uri)));
         if (conflicts.length) {
@@ -41,7 +42,7 @@ export class ConflictPresentation implements vscode.FileDecorationProvider, vsco
             this.status.show();
         } else { this.status.hide(); }
 
-        if (!ready) { this.notifications.takeNew(records,false); return; }
+        if (!ready) { this.notifications.takeNew(this.records,false); return; }
         if (!this.notificationTimer) {
             this.notificationTimer=setTimeout(()=>{
                 this.notificationTimer=undefined;
